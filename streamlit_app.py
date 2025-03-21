@@ -11,6 +11,11 @@ import json
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 import logging
+import time
+import sys
+import traceback
+from collections import defaultdict
+from io import StringIO
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -24,7 +29,9 @@ from agent import (
     setup_google_services, 
     create_faiss_index,
     ArchonClient,
-    validate_env_vars
+    validate_env_vars,
+    authenticate_google,
+    TechevoRagAgent
 )
 
 # Import Supabase client
@@ -32,6 +39,9 @@ from supabase import create_client
 
 # Import Supabase setup
 from setup_supabase import init_supabase
+
+# Import agent tools
+from agent_tools import load_cache, save_cache
 
 # Configure logging with logfire
 logfire.configure(
@@ -59,6 +69,10 @@ if 'initialized' not in st.session_state:
     st.session_state.results = {}
     st.session_state.processing = False
     st.session_state.error_details = {}
+    st.session_state.services = {}
+    st.session_state.log_output = StringIO()
+    sys.stdout = st.session_state.log_output
+    sys.stderr = st.session_state.log_output
 
 # Define an async function that gets called by a sync wrapper
 async def initialize_services():
@@ -102,6 +116,16 @@ async def initialize_services():
             state={}
         )
         
+        # Initialize services
+        st.session_state.services = {
+            'gmail': gmail_service,
+            'drive': drive_service,
+            'faiss_index': faiss_index,
+            'supabase': supabase,
+            'archon_client': archon_client,
+            'deps': deps
+        }
+        
         return gmail_service, drive_service, faiss_index, supabase, archon_client, deps
     
     except Exception as e:
@@ -114,7 +138,12 @@ async def initialize_services():
 # Sync wrapper for the async initialization
 def sync_initialize_services():
     """Synchronous wrapper for initialization."""
-    return asyncio.run(initialize_services())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(initialize_services())
+    finally:
+        loop.close()
 
 # Async function to run the agent
 async def run_agent_async(query: str, deps: EnhancedDeps):
@@ -479,4 +508,132 @@ def on_exit():
 
 # Register exit handler
 import atexit
-atexit.register(on_exit) 
+atexit.register(on_exit)
+
+def main():
+    """Main Streamlit app function."""
+    st.title("Techevo RAG Agent")
+    
+    # Auto-refresh for logs
+    st_autorefresh(interval=5000, key='logrefresh')
+    
+    # Initialize services
+    if 'initialized' not in st.session_state:
+        st.session_state.initialized = False
+    
+    if not st.session_state.initialized:
+        if st.button("Initialize Services"):
+            with st.spinner("Initializing services..."):
+                st.session_state.services = sync_initialize_services()
+                st.session_state.initialized = True
+    else:
+        # Service status display
+        st.sidebar.header("Service Status")
+        
+        services_status = {
+            "Google API": '✅' if 'gmail' in st.session_state.services else '❌',
+            "FAISS Index": '✅' if 'faiss_index' in st.session_state.services else '❌',
+            "Supabase": '✅' if 'supabase' in st.session_state.services else '❌',
+            "Archon": '✅' if 'archon_client' in st.session_state.services else '❌'
+        }
+        
+        for service, status in services_status.items():
+            st.sidebar.write(f"{service}: {status}")
+        
+        # Show errors if any
+        if 'errors' in st.session_state.services:
+            st.sidebar.header("Initialization Errors")
+            for service, error in st.session_state.services['errors'].items():
+                st.sidebar.error(f"{service}: {error}")
+        
+        # Input section
+        st.write("Enter your query below:")
+        query = st.text_input("Query", key="query_input")
+        
+        # Use a form to handle submissions
+        with st.form(key="query_form"):
+            submit_button = st.form_submit_button(label="Run Agent")
+            
+            if submit_button and query:
+                with st.spinner("Running the agent..."):
+                    result = sync_run_agent(query, st.session_state.deps)
+                    
+                    # Display results
+                    st.header("Results")
+                    
+                    # Display any errors
+                    if 'error' in result:
+                        st.error(f"Error: {result['error']}")
+                        if 'tool' in result:
+                            st.write(f"Failed tool: {result['tool']}")
+                    
+                    # Show tools used
+                    if 'tools_used' in result:
+                        st.write(f"Tools used: {', '.join(result['tools_used'])}")
+                    
+                    # Display RAG results
+                    if 'results' in result and 'rag' in result['results']:
+                        rag = result['results']['rag']
+                        st.subheader("RAG Response")
+                        st.write(rag.get('answer', 'No answer generated'))
+                        st.write(f"Context size: {rag.get('context_size', 0)} characters")
+                        st.write(f"Context documents used: {rag.get('context_used', 0)}")
+                    
+                    # Display emails
+                    if 'results' in result and 'emails' in result['results']:
+                        emails = result['results']['emails']
+                        st.subheader(f"Emails Found: {len(emails)}")
+                        
+                        for i, email in enumerate(emails):
+                            with st.expander(f"{email.get('subject', 'No Subject')} - {email.get('from', 'Unknown')}"):
+                                st.write(f"From: {email.get('from', 'Unknown')}")
+                                st.write(f"Date: {email.get('date', 'Unknown')}")
+                                
+                                # Show full body if available, otherwise snippet
+                                if 'body' in email and email['body']:
+                                    st.text_area(f"Body", email['body'], height=200)
+                                else:
+                                    st.write(f"Snippet: {email.get('snippet', 'No content')}")
+                                
+                                # Show attachments
+                                if 'attachments' in email and email['attachments']:
+                                    st.write(f"Attachments: {len(email['attachments'])}")
+                                    for attachment in email['attachments']:
+                                        st.write(f"- {attachment.get('filename', 'Unnamed')} ({attachment.get('mimeType', 'Unknown type')})")
+                    
+                    # Display attachments
+                    if 'results' in result and 'attachments' in result['results']:
+                        attachments = result['results']['attachments']
+                        st.subheader(f"Attachments Downloaded: {len(attachments)}")
+                        
+                        for i, attachment in enumerate(attachments):
+                            if 'error' in attachment:
+                                st.error(f"Error with {attachment.get('filename', 'unknown')}: {attachment['error']}")
+                            else:
+                                st.write(f"✅ {attachment.get('filename', 'File')} - [Drive Link]({attachment.get('drive_link', '#')})")
+                    
+                    # Display Drive files
+                    if 'results' in result and 'drive_files' in result['results']:
+                        files = result['results']['drive_files']
+                        st.subheader(f"Drive Files Found: {len(files)}")
+                        
+                        for i, file in enumerate(files):
+                            with st.expander(f"{file.get('name', 'Unnamed')} ({file.get('mimeType', 'Unknown type')})"):
+                                st.write(f"Type: {file.get('mimeType', 'Unknown')}")
+                                st.write(f"Modified: {file.get('modifiedTime', 'Unknown')}")
+                                
+                                if 'webViewLink' in file:
+                                    st.write(f"[Open in Drive]({file['webViewLink']})")
+                                
+                                if 'content' in file:
+                                    st.text_area(f"Content Preview", file['content'], height=200)
+                                elif 'content_error' in file:
+                                    st.error(f"Error fetching content: {file['content_error']}")
+    
+    # Display logs
+    st.sidebar.header("Logs")
+    logs = st.session_state.log_output.getvalue()
+    st.sidebar.text_area("Latest logs", logs[-5000:] if len(logs) > 5000 else logs, height=400)
+
+if __name__ == "__main__":
+    main() 
