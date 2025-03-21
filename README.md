@@ -92,6 +92,18 @@ MIT License
 
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
 
+## GitHub Setup
+
+As the GitHub MCP integration requires authentication, please follow these manual steps to push this repository:
+
+1. Create a new private repository on GitHub named "Techevo-RAG"
+2. Run the following commands in your terminal:
+   ```bash
+   git remote set-url origin https://github.com/YOUR_USERNAME/Techevo-RAG.git
+   git push -u origin master
+   ```
+3. Enter your GitHub credentials when prompted
+
 ## Example Queries
 
 - "Search for emails about marketing campaigns"
