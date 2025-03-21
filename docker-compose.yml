@@ -1,0 +1,20 @@
+version: '3'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8502:8502"
+    volumes:
+      - .:/app
+      - token-data:/app/token-data
+    env_file:
+      - .env
+    command: streamlit run streamlit_app.py --server.port 8502 --server.address 0.0.0.0
+    restart: unless-stopped
+
+volumes:
+  token-data:
+    # Persistent volume for token storage 

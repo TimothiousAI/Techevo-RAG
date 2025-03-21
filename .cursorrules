@@ -1,0 +1,21 @@
+## Instructions for the AI Agent
+- Keep all prompts to Archon MCP under 5k tokens to avoid overwhelming its 30k tokens-per-minute limit.
+- If Archon MCP output appears incomplete (e.g., missing tools, broken logic), revert to the previous file state and resend the full context (all relevant files + query) to Archon MCP for correction.
+- Use concise, modular code with clear function names and docstrings for readability.
+- Validate environment variables from `.env` at startup and raise descriptive errors if missing.
+- Prefer asynchronous execution (e.g., `asyncio`) for all I/O operations (Gmail, Drive, Supabase).
+- Leverage Supabase MCP for tracking instead of local PostgreSQL for scalability.
+- Commit changes to GitHub MCP frequently to maintain version history.
+
+## Lessons Learned
+- Archon crashes and loses context if sent >30k tokens per minute; keep interactions short and focused.
+- Previous Archon outputs were incomplete (e.g., missing RAG logic, placeholder tools); ensure all features are fully implemented.
+- Cursor nested `Techevo-RAG` folders in prior runs; always verify folder structure and fix if needed.
+- MCP placeholders need explicit replacement with actual calls (e.g., `cursor.mcp.archon.invoke`).
+
+## Scratch Pad / Notes
+- Project goal: Build an autonomous agentic RAG system mirroring n8n-agentic-rag-agent.
+- Current status: Archon provided a skeleton; needs full RAG, Supabase integration, and Streamlit UI enhancements.
+- TODO: Test MCP connections (Archon, Supabase, GitHub) after refinement.
+- Note: Use `sentence-transformers` model `all-MiniLM-L6-v2` for 768-dim embeddings with FAISS.
+- Reminder: Streamlit must run on port 8502 (`--server.port 8502`).
