@@ -14,6 +14,7 @@ import logging
 from dataclasses import dataclass, field
 import hashlib
 from datetime import datetime
+import copy
 
 # Google API imports
 from google.oauth2.credentials import Credentials
@@ -35,6 +36,9 @@ from pydantic_ai.agent.context import AgentContext
 from pydantic_ai.agent.retry import ModelRetry
 from pydantic_ai.agent.parallel import parallel
 
+# Logging with logfire
+import logfire
+
 # Local imports
 from agent_prompts import SYSTEM_PROMPT, INTENT_PROMPT
 import agent_tools
@@ -45,6 +49,14 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Configure logfire
+logfire.configure(
+    app_name="techevo-rag",
+    level="INFO",
+    capture_stdout=True,
+    capture_stderr=True
+)
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -69,9 +81,9 @@ def validate_env_vars() -> None:
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     
     if missing_vars:
-        raise ValueError(
-            f"Missing required environment variables: {', '.join(missing_vars)}. "
-            "Please add them to your .env file.")
+        error_msg = f"Missing required environment variables: {', '.join(missing_vars)}. Please add them to your .env file."
+        logfire.error(error_msg)
+        raise ValueError(error_msg)
 
 # Google API scopes
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly',
@@ -84,6 +96,7 @@ class ArchonClient:
     def __init__(self):
         self.session = None
         self.thread_id = None
+        self._prev_states = {}  # Store previous states to revert if needed
     
     async def ensure_session(self):
         """Ensure an aiohttp session exists."""
@@ -101,17 +114,24 @@ class ArchonClient:
             return self.thread_id
             
         try:
-            # In an actual implementation using Cursor's MCP protocol
-            # This would use the cursor.mcp functions directly
-            # Here we're using a pattern that's compatible with the MCP API
+            # Direct MCP call through Cursor
             import cursor.mcp.archon as archon_mcp
             
             result = await archon_mcp.create_thread(random_string="init")
             self.thread_id = result
             logger.info(f"Created Archon thread: {self.thread_id}")
+            logfire.info(f"Created Archon thread: {self.thread_id}")
+            return self.thread_id
+        except ImportError:
+            logger.warning("Cursor MCP not available, falling back to placeholder thread ID")
+            logfire.warning("Cursor MCP not available, falling back to placeholder thread ID")
+            # Fallback to a placeholder ID for testing without Cursor
+            self.thread_id = f"thread_{datetime.now().timestamp()}"
             return self.thread_id
         except Exception as e:
-            logger.error(f"Error creating Archon thread: {str(e)}")
+            error_msg = f"Error creating Archon thread: {str(e)}"
+            logger.error(error_msg)
+            logfire.error(error_msg)
             # Fallback to a placeholder ID for testing
             self.thread_id = f"thread_{datetime.now().timestamp()}"
             return self.thread_id
@@ -128,16 +148,41 @@ class ArchonClient:
             str: The agent's response
         """
         try:
-            # In an actual implementation using Cursor's MCP protocol
+            # Direct MCP call through Cursor
             import cursor.mcp.archon as archon_mcp
             
             result = await archon_mcp.run_agent(
                 thread_id=thread_id,
                 user_input=user_input
             )
+            
+            # Verify response isn't empty or invalid
+            if not result or len(result.strip()) < 10:
+                logger.warning("Empty or very short response from Archon")
+                logfire.warning("Empty or very short response from Archon")
+                raise ValueError("Empty or invalid response from Archon")
+                
             return result
+        except ImportError:
+            logger.warning("Cursor MCP not available, falling back to OpenAI")
+            logfire.warning("Cursor MCP not available, falling back to OpenAI")
+            # For testing purposes without Cursor
+            import openai
+            openai.api_key = os.getenv("OPENAI_API_KEY")
+            
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_input}
+                ],
+                temperature=0.2
+            )
+            return response.choices[0].message.content
         except Exception as e:
-            logger.error(f"Error running Archon agent: {str(e)}")
+            error_msg = f"Error running Archon agent: {str(e)}"
+            logger.error(error_msg)
+            logfire.error(error_msg)
             # For testing purposes only
             return f"Simulated response to: {user_input}"
     
@@ -155,22 +200,60 @@ class ArchonClient:
         """
         await self.ensure_session()
         
+        # Save original prompt to support retry
+        original_prompt = prompt
+        
         # Keep prompt size under 5k tokens to avoid Archon MCP limits
         if len(prompt) > 5000:
             logger.warning(f"Prompt size exceeds recommended limit: {len(prompt)} chars")
+            logfire.warning(f"Prompt size exceeds recommended limit: {len(prompt)} chars")
             # Truncate if needed
             prompt = prompt[:4800] + "...[truncated]"
         
-        # Get or create thread
-        thread_id = await self.create_thread()
-        
-        # Run the agent
-        response_text = await self.run_agent(
-            thread_id=thread_id,
-            user_input=prompt
-        )
-        
-        return {"response": response_text}
+        try:
+            # Direct MCP call through Cursor
+            import cursor.mcp.archon as archon_mcp
+            
+            # Get or create thread
+            thread_id = await self.create_thread()
+            
+            # Run the agent
+            response_text = await self.run_agent(
+                thread_id=thread_id,
+                user_input=prompt
+            )
+            
+            return {"response": response_text}
+            
+        except ImportError:
+            logger.warning("Cursor MCP not available, falling back to OpenAI")
+            logfire.warning("Cursor MCP not available, falling back to OpenAI")
+            # Fallback to OpenAI for testing without Cursor
+            import openai
+            openai.api_key = os.getenv("OPENAI_API_KEY")
+            
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=kwargs.get('temperature', 0.2),
+                max_tokens=kwargs.get('max_tokens', 500)
+            )
+            
+            return {"response": response.choices[0].message.content}
+            
+        except Exception as e:
+            error_msg = f"Error generating with Archon: {str(e)}"
+            logger.error(error_msg)
+            logfire.error(error_msg)
+            return {"response": "Error processing your request"}
+    
+    def save_state(self, key: str, state: Any):
+        """Save a state to allow reverting if needed."""
+        self._prev_states[key] = copy.deepcopy(state)
+    
+    def get_previous_state(self, key: str) -> Any:
+        """Get a previously saved state."""
+        return self._prev_states.get(key)
 
 @dataclass
 class EnhancedDeps(Deps):
@@ -205,9 +288,10 @@ async def setup_google_services() -> Tuple[Any, Any]:
             creds.refresh(Request())
         else:
             if not credentials_path or not os.path.exists(credentials_path):
-                raise ValueError(
-                    f"Credentials file not found at {credentials_path}. "
-                    "Please set CREDENTIALS_JSON_PATH in .env to a valid credentials.json file.")
+                error_msg = f"Credentials file not found at {credentials_path}. Please set CREDENTIALS_JSON_PATH in .env to a valid credentials.json file."
+                logger.error(error_msg)
+                logfire.error(error_msg)
+                raise ValueError(error_msg)
                 
             flow = InstalledAppFlow.from_client_secrets_file(
                 credentials_path, SCOPES)
@@ -247,6 +331,9 @@ async def predict_intent(query: str, archon_client: ArchonClient) -> List[str]:
         List of tool names to execute
     """
     try:
+        # Save previous state before prediction
+        archon_client.save_state('predict_intent_query', query)
+        
         # Use a concise prompt to stay below token limits
         prompt = INTENT_PROMPT.format(query=query)
         
@@ -265,6 +352,16 @@ async def predict_intent(query: str, archon_client: ArchonClient) -> List[str]:
             # Check if it looks like a Python list representation
             if intent_text.startswith('[') and intent_text.endswith(']'):
                 tools = json.loads(intent_text)
+                
+                # Verify response is valid
+                if not tools or not isinstance(tools, list):
+                    error_msg = "Invalid tools list from Archon, retrying with context"
+                    logger.error(error_msg)
+                    logfire.error(error_msg)
+                    
+                    # Retry with more context
+                    return await retry_predict_intent(query, archon_client)
+                    
                 return tools
             else:
                 # Handle plaintext responses by looking for tool names
@@ -275,6 +372,11 @@ async def predict_intent(query: str, archon_client: ArchonClient) -> List[str]:
                     if tool.lower() in intent_text.lower():
                         found_tools.append(tool)
                 
+                if not found_tools:
+                    logger.warning("No tools found in plaintext response, retrying")
+                    logfire.warning("No tools found in plaintext response, retrying")
+                    return await retry_predict_intent(query, archon_client)
+                    
                 return found_tools
         except json.JSONDecodeError:
             # Handle plain text responses
@@ -287,11 +389,78 @@ async def predict_intent(query: str, archon_client: ArchonClient) -> List[str]:
             elif 'drive' in intent_text.lower():
                 return ['search_drive']
             else:
-                return []
+                logger.warning("Could not parse tools from response, retrying")
+                logfire.warning("Could not parse tools from response, retrying")
+                return await retry_predict_intent(query, archon_client)
     
     except Exception as e:
-        logger.error(f"Error predicting intent: {str(e)}")
-        return []
+        error_msg = f"Error predicting intent: {str(e)}"
+        logger.error(error_msg)
+        logfire.error(error_msg)
+        
+        # Fall back to a default set of tools
+        return ['search_emails', 'perform_rag']
+
+async def retry_predict_intent(query: str, archon_client: ArchonClient) -> List[str]:
+    """
+    Retry intent prediction with more context if the first attempt failed.
+    
+    Args:
+        query: The user query
+        archon_client: The Archon MCP client
+        
+    Returns:
+        List of tool names to execute
+    """
+    try:
+        # More detailed prompt with examples
+        detailed_prompt = f"""
+        Analyze this query: "{query}"
+        
+        Determine which tools to use from:
+        - search_emails: Search for emails matching criteria
+        - download_attachment: Download attachments from emails
+        - perform_rag: Perform retrieval augmented generation
+        - search_drive: Search files in Google Drive
+        
+        Examples:
+        - "find emails about marketing" → ["search_emails"]
+        - "download attachments from project emails" → ["search_emails", "download_attachment"]
+        - "process campaign data" → ["search_emails", "download_attachment", "perform_rag"]
+        
+        Return only a JSON array of tool names, like: ["tool1", "tool2"]
+        """
+        
+        response = await archon_client.generate(
+            model="openai:gpt-4o",
+            prompt=detailed_prompt,
+            temperature=0.1,
+            max_tokens=100
+        )
+        
+        intent_text = response.get('response', '').strip()
+        
+        # Try to parse as JSON
+        try:
+            if '[' in intent_text and ']' in intent_text:
+                # Extract the array part
+                start = intent_text.find('[')
+                end = intent_text.rfind(']') + 1
+                array_text = intent_text[start:end]
+                
+                tools = json.loads(array_text)
+                if tools and isinstance(tools, list):
+                    return tools
+            
+            # If parsing fails, use default tools
+            return ['search_emails', 'perform_rag']
+        except:
+            # Default fallback
+            return ['search_emails', 'perform_rag']
+    except Exception as e:
+        logger.error(f"Error in retry_predict_intent: {str(e)}")
+        logfire.error(f"Error in retry_predict_intent: {str(e)}")
+        return ['search_emails', 'perform_rag']
 
 class TechevoRagAgent(Agent):
     """
@@ -318,10 +487,21 @@ class TechevoRagAgent(Agent):
                 'rag_results': []
             }
             
+            # Save initial state for possible reversion
+            deps.archon_client.save_state('initial_state', deps.state)
+            
             # Predict intent
             logger.info(f"Predicting intent for query: {query}")
+            logfire.info(f"Predicting intent for query: {query}")
             intent_tools = await predict_intent(query, deps.archon_client)
             logger.info(f"Predicted tools: {intent_tools}")
+            logfire.info(f"Predicted tools: {intent_tools}")
+            
+            # Crash protection: if no tools returned, use defaults
+            if not intent_tools:
+                logger.warning("No tools predicted, using default tools")
+                logfire.warning("No tools predicted, using default tools")
+                intent_tools = ['search_emails', 'perform_rag']
             
             result = {
                 'status': 'success',
@@ -331,49 +511,76 @@ class TechevoRagAgent(Agent):
             # Execute tools based on intent
             if 'search_emails' in intent_tools:
                 logger.info("Searching emails...")
-                emails = await agent_tools.search_emails(
-                    AgentContext(agent=self, deps=deps, log=logger),
-                    query=query
-                )
-                
-                result['data']['emails'] = emails
-                deps.state['processed_emails'] = emails
-                
-                # If download_attachment is also in the intent, process attachments
-                if 'download_attachment' in intent_tools:
-                    attachment_results = []
+                logfire.info("Searching emails...")
+                try:
+                    emails = await agent_tools.search_emails(
+                        AgentContext(agent=self, deps=deps, log=logger),
+                        query=query
+                    )
                     
-                    for email in emails:
-                        if email.get('attachments'):
-                            for attachment in email.get('attachments', []):
-                                logger.info(f"Downloading attachment {attachment.get('filename', 'unknown')} from email {email['id']}")
-                                
-                                download_result = await agent_tools.download_attachment(
-                                    AgentContext(agent=self, deps=deps, log=logger),
-                                    email_id=email['id'],
-                                    attachment_id=attachment['id'],
-                                    folder_id=os.getenv('DEFAULT_DRIVE_FOLDER_ID')
-                                )
-                                
-                                attachment_results.append(download_result)
+                    result['data']['emails'] = emails
+                    deps.state['processed_emails'] = emails
                     
-                    result['data']['attachments'] = attachment_results
-                    deps.state['downloaded_attachments'] = attachment_results
+                    # If download_attachment is also in the intent, process attachments
+                    if 'download_attachment' in intent_tools and emails:
+                        attachment_results = []
+                        
+                        for email in emails:
+                            if email.get('attachments'):
+                                for attachment in email.get('attachments', []):
+                                    logger.info(f"Downloading attachment {attachment.get('filename', 'unknown')} from email {email['id']}")
+                                    logfire.info(f"Downloading attachment {attachment.get('filename', 'unknown')} from email {email['id']}")
+                                    
+                                    try:
+                                        download_result = await agent_tools.download_attachment(
+                                            AgentContext(agent=self, deps=deps, log=logger),
+                                            email_id=email['id'],
+                                            attachment_id=attachment['id'],
+                                            folder_id=os.getenv('DEFAULT_DRIVE_FOLDER_ID')
+                                        )
+                                        
+                                        attachment_results.append(download_result)
+                                    except Exception as e:
+                                        error_msg = f"Error downloading attachment: {str(e)}"
+                                        logger.error(error_msg)
+                                        logfire.error(error_msg)
+                                        attachment_results.append({
+                                            'status': 'error',
+                                            'filename': attachment.get('filename', 'unknown'),
+                                            'email_id': email['id'],
+                                            'error': str(e)
+                                        })
+                        
+                        result['data']['attachments'] = attachment_results
+                        deps.state['downloaded_attachments'] = attachment_results
+                except Exception as e:
+                    error_msg = f"Error searching emails: {str(e)}"
+                    logger.error(error_msg)
+                    logfire.error(error_msg)
+                    result['data']['email_error'] = str(e)
             
             if 'search_drive' in intent_tools:
                 logger.info("Searching Drive...")
+                logfire.info("Searching Drive...")
                 folder_id = os.getenv('DEFAULT_DRIVE_FOLDER_ID')
                 
-                drive_files = await agent_tools.search_drive(
-                    AgentContext(agent=self, deps=deps, log=logger),
-                    folder_id=folder_id
-                )
-                
-                result['data']['drive_files'] = drive_files
-                deps.state['drive_files'] = drive_files
+                try:
+                    drive_files = await agent_tools.search_drive(
+                        AgentContext(agent=self, deps=deps, log=logger),
+                        folder_id=folder_id
+                    )
+                    
+                    result['data']['drive_files'] = drive_files
+                    deps.state['drive_files'] = drive_files
+                except Exception as e:
+                    error_msg = f"Error searching Drive: {str(e)}"
+                    logger.error(error_msg)
+                    logfire.error(error_msg)
+                    result['data']['drive_error'] = str(e)
             
             if 'perform_rag' in intent_tools:
                 logger.info("Performing RAG...")
+                logfire.info("Performing RAG...")
                 
                 # Gather documents from the workflow results so far
                 documents = []
@@ -390,19 +597,33 @@ class TechevoRagAgent(Agent):
                 # This is simplified - in a real system, you'd need to fetch and parse files
                 
                 if documents:
-                    rag_result = await agent_tools.perform_rag(
-                        AgentContext(agent=self, deps=deps, log=logger),
-                        query=query,
-                        documents=documents
-                    )
-                    
-                    result['data']['rag_result'] = rag_result
-                    deps.state['rag_results'] = rag_result
+                    try:
+                        rag_result = await agent_tools.perform_rag(
+                            AgentContext(agent=self, deps=deps, log=logger),
+                            query=query,
+                            documents=documents
+                        )
+                        
+                        result['data']['rag_result'] = rag_result
+                        deps.state['rag_results'] = rag_result
+                    except Exception as e:
+                        error_msg = f"Error performing RAG: {str(e)}"
+                        logger.error(error_msg)
+                        logfire.error(error_msg)
+                        result['data']['rag_error'] = str(e)
             
             return result
             
         except Exception as e:
-            logger.error(f"Error running workflow: {str(e)}")
+            error_msg = f"Error running workflow: {str(e)}"
+            logger.error(error_msg)
+            logfire.error(error_msg)
+            
+            # Try to use previous state if available
+            previous_state = deps.archon_client.get_previous_state('initial_state')
+            if previous_state:
+                deps.state = previous_state
+            
             return {
                 'status': 'error',
                 'error': str(e)
@@ -419,22 +640,36 @@ async def main() -> None:
     Main function to run the agent.
     """
     try:
+        # Configure logfire
+        logfire.configure(
+            app_name="techevo-rag",
+            level="INFO",
+            capture_stdout=True,
+            capture_stderr=True
+        )
+        
+        logfire.info("Starting Techevo-RAG agent")
+        
         # Validate environment variables
         validate_env_vars()
         
         # Set up services
+        logfire.info("Setting up Google services")
         gmail_service, drive_service = await setup_google_services()
         
         # Set up FAISS index with correct dimension for all-MiniLM-L6-v2 (768)
+        logfire.info("Creating FAISS index")
         faiss_index = create_faiss_index(dimension=768)
         
         # Set up Supabase client
+        logfire.info("Connecting to Supabase")
         supabase = create_client(
             os.getenv('SUPABASE_URL'),
             os.getenv('SUPABASE_KEY')
         )
         
         # Set up Archon client
+        logfire.info("Setting up Archon client")
         archon_client = ArchonClient()
         
         # Create dependencies
@@ -449,14 +684,23 @@ async def main() -> None:
         
         # Example query
         query = "process campaign emails"
+        logfire.info(f"Running test query: {query}")
         
         # Run the workflow
         result = await primary_agent.run_workflow(query, deps)
         
+        if result.get('status') == 'success':
+            logfire.info(f"Workflow completed successfully with data keys: {', '.join(result.get('data', {}).keys())}")
+        else:
+            logfire.error(f"Workflow failed: {result.get('error', 'Unknown error')}")
+        
         print("Workflow result:", result)
         
     except Exception as e:
-        logger.error(f"Error in main: {str(e)}")
+        error_msg = f"Error in main: {str(e)}"
+        logger.error(error_msg)
+        logfire.error(error_msg)
+        print(f"Error: {str(e)}")
 
 if __name__ == "__main__":
     asyncio.run(main()) 

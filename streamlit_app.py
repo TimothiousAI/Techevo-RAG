@@ -15,6 +15,7 @@ import logging
 import streamlit as st
 from dotenv import load_dotenv
 import logfire
+from st_autorefresh import st_autorefresh
 
 # Import agent components
 from agent import (
@@ -28,6 +29,9 @@ from agent import (
 
 # Import Supabase client
 from supabase import create_client
+
+# Import Supabase setup
+from setup_supabase import init_supabase
 
 # Configure logging with logfire
 logfire.configure(
@@ -54,6 +58,7 @@ if 'initialized' not in st.session_state:
     st.session_state.logs = []
     st.session_state.results = {}
     st.session_state.processing = False
+    st.session_state.error_details = {}
 
 # Define an async function that gets called by a sync wrapper
 async def initialize_services():
@@ -73,6 +78,16 @@ async def initialize_services():
             os.getenv('SUPABASE_URL'),
             os.getenv('SUPABASE_KEY')
         )
+        
+        # Initialize Supabase tables
+        try:
+            await init_supabase()
+            add_log("Supabase tables initialized successfully")
+        except Exception as e:
+            error_msg = f"Warning: Supabase table initialization failed: {str(e)}"
+            logger.warning(error_msg)
+            logfire.warning(error_msg)
+            add_log(error_msg)
         
         # Set up Archon client
         archon_client = ArchonClient()
@@ -109,13 +124,52 @@ async def run_agent_async(query: str, deps: EnhancedDeps):
         logger.info(log_msg)
         logfire.info(log_msg)
         
+        # Reset error details
+        st.session_state.error_details = {}
+        
         result = await primary_agent.run_workflow(query, deps)
+        
+        # Check for tool-specific errors
+        if result.get('status') == 'success':
+            data = result.get('data', {})
+            
+            # Check for specific error fields in data
+            for error_key in ['email_error', 'drive_error', 'rag_error']:
+                if error_key in data:
+                    if 'tool_errors' not in st.session_state.error_details:
+                        st.session_state.error_details['tool_errors'] = {}
+                    
+                    tool_name = error_key.split('_')[0]
+                    st.session_state.error_details['tool_errors'][tool_name] = data[error_key]
+                    add_log(f"Error in {tool_name} tool: {data[error_key]}")
+            
+            # Check for errors in attachment results
+            if 'attachments' in data:
+                attachment_errors = []
+                for attachment in data['attachments']:
+                    if attachment.get('status') == 'error':
+                        attachment_errors.append({
+                            'filename': attachment.get('filename', 'Unknown file'),
+                            'error': attachment.get('error', 'Unknown error')
+                        })
+                
+                if attachment_errors:
+                    if 'tool_errors' not in st.session_state.error_details:
+                        st.session_state.error_details['tool_errors'] = {}
+                    
+                    st.session_state.error_details['tool_errors']['attachments'] = attachment_errors
+                    add_log(f"Errors in {len(attachment_errors)} attachment(s)")
+        
         return result
     
     except Exception as e:
         error_msg = f"Error running agent: {str(e)}"
         logger.error(error_msg)
         logfire.error(error_msg)
+        
+        # Store the error details
+        st.session_state.error_details['main_error'] = str(e)
+        
         return {
             'status': 'error',
             'error': str(e)
@@ -141,6 +195,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Set up auto-refresh for logs (every 5 seconds)
+refresh_interval = 5  # seconds
+st_autorefresh(interval=refresh_interval * 1000, key="datarefresh")
 
 # App title and description
 st.title("📊 Techevo-RAG System")
@@ -211,6 +269,21 @@ if st.session_state.initialized:
         else:
             st.error("❌ FAISS Index")
     
+    # Display tool errors if any
+    if 'error_details' in st.session_state and st.session_state.error_details:
+        with st.expander("⚠️ Error Details", expanded=True):
+            if 'main_error' in st.session_state.error_details:
+                st.error(f"Main Error: {st.session_state.error_details['main_error']}")
+            
+            if 'tool_errors' in st.session_state.error_details:
+                for tool, error in st.session_state.error_details['tool_errors'].items():
+                    if tool == 'attachments':
+                        st.warning(f"Attachment Errors:")
+                        for att_error in error:
+                            st.warning(f"- {att_error['filename']}: {att_error['error']}")
+                    else:
+                        st.warning(f"{tool.capitalize()} Error: {error}")
+    
     # Query input
     st.markdown("### Enter a command")
     query = st.text_input("", value="process campaign emails", placeholder="e.g., process campaign emails")
@@ -237,6 +310,9 @@ if st.session_state.initialized:
             add_log(f"Running query: {query}")
             status_container.info("⏳ Processing query...")
             
+            # Clear previous error details
+            st.session_state.error_details = {}
+            
             # Run the agent
             result = sync_run_agent(query, st.session_state.deps)
             
@@ -248,6 +324,10 @@ if st.session_state.initialized:
                 status_container.success(f"✅ Query completed successfully")
             else:
                 status_container.error(f"❌ Query failed: {result.get('error', 'Unknown error')}")
+                
+                # Store error details for display
+                if 'error' in result:
+                    st.session_state.error_details['main_error'] = result['error']
         
         st.session_state.processing = False
     
@@ -279,6 +359,27 @@ if st.session_state.initialized:
                         })
                     
                     st.table(email_df)
+                    
+                    # Show email content if available
+                    if st.checkbox("Show Email Content"):
+                        selected_email_id = st.selectbox(
+                            "Select an email to view content",
+                            options=[email['id'] for email in data['emails']],
+                            format_func=lambda x: next((email['subject'] for email in data['emails'] if email['id'] == x), x)
+                        )
+                        
+                        if selected_email_id:
+                            selected_email = next((email for email in data['emails'] if email['id'] == selected_email_id), None)
+                            if selected_email:
+                                st.markdown(f"**Subject:** {selected_email.get('subject', 'No Subject')}")
+                                st.markdown(f"**From:** {selected_email.get('sender', 'Unknown')}")
+                                st.markdown(f"**Date:** {selected_email.get('date', 'Unknown')}")
+                                
+                                # Show the body if available
+                                if 'body' in selected_email and selected_email['body']:
+                                    st.text_area("Body", value=selected_email['body'], height=300)
+                                else:
+                                    st.text_area("Snippet", value=selected_email.get('snippet', 'No content available'), height=150)
             
             # Display attachments if available
             if 'attachments' in data:
@@ -309,6 +410,19 @@ if st.session_state.initialized:
                         })
                     
                     st.table(drive_df)
+                    
+                    # Show file content if available
+                    if st.checkbox("Show File Content"):
+                        selected_file_id = st.selectbox(
+                            "Select a file to view content",
+                            options=[file['id'] for file in data['drive_files'] if file.get('snippet')],
+                            format_func=lambda x: next((file['name'] for file in data['drive_files'] if file['id'] == x), x)
+                        )
+                        
+                        if selected_file_id:
+                            selected_file = next((file for file in data['drive_files'] if file['id'] == selected_file_id), None)
+                            if selected_file and 'snippet' in selected_file:
+                                st.text_area("File content", value=selected_file['snippet'], height=300)
             
             # Display RAG results if available
             if 'rag_result' in data:
@@ -318,12 +432,13 @@ if st.session_state.initialized:
                     st.markdown(f"**Query:** {rag_result.get('query', 'Unknown')}")
                     st.markdown(f"**Response:** {rag_result.get('response', 'No response generated')}")
                     
-                    st.subheader("Source Chunks")
+                    # Show source chunks
                     chunks = rag_result.get('chunks_used', [])
-                    
-                    for i, chunk in enumerate(chunks):
-                        with st.expander(f"Chunk {i+1}"):
-                            st.text(chunk)
+                    if chunks:
+                        st.subheader("Source Chunks")
+                        for i, chunk in enumerate(chunks):
+                            with st.expander(f"Chunk {i+1}"):
+                                st.text(chunk)
 else:
     st.warning("Services not initialized. Please check the logs and try reloading the page.")
 

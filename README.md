@@ -131,4 +131,8 @@ MIT License
 
 ## Contributing
 
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change. 
+Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
+
+## Repository History
+
+- Committed initial version on `2023-10-22` (Initial functional agent with OAuth, RAG, and UI) 

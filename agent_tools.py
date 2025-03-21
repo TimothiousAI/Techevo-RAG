@@ -26,22 +26,42 @@ from pydantic_ai.agent.context import AgentContext
 from pydantic_ai.agent.retry import ModelRetry
 from pydantic_ai.agent.parallel import parallel
 
+from agent_prompts import (
+    RAG_PROMPT,
+    EMAIL_SEARCH_PROMPT, 
+    DOCUMENT_PROCESSING_PROMPT,
+    SEARCH_CRITERIA_PROMPT
+)
+
 # Cache file for storing email search results
-CACHE_FILE = "cache.json"
+CACHE_FILE = "cache/search_results.json"
+os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
 
 # Initialize cache
 def load_cache() -> Dict[str, Any]:
-    """Load the cache from the cache file."""
+    """
+    Load cached search results.
+    
+    Returns:
+        Dict containing cached results
+    """
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, 'r') as f:
                 return json.load(f)
         except json.JSONDecodeError:
-            return {"email_searches": {}, "drive_searches": {}}
-    return {"email_searches": {}, "drive_searches": {}}
+            logger.warning(f"Could not parse cache file {CACHE_FILE}")
+            logfire.warning(f"Could not parse cache file {CACHE_FILE}")
+            return {}
+    return {}
 
 def save_cache(cache: Dict[str, Any]) -> None:
-    """Save the cache to the cache file."""
+    """
+    Save search results to cache.
+    
+    Args:
+        cache: Dict containing results to cache
+    """
     with open(CACHE_FILE, 'w') as f:
         json.dump(cache, f, indent=2)
 
@@ -57,19 +77,47 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict[str, Any]]:
     Returns:
         A list of emails with id, snippet, and attachment metadata
     """
-    # Check if we have cached results
-    cache = load_cache()
-    cache_key = f"email_{query}"
+    logfire.info(f"Searching emails with query: {query}")
     
-    if cache_key in cache["email_searches"]:
-        ctx.log.info(f"Using cached results for email search query: {query}")
-        return cache["email_searches"][cache_key]
+    # Check if results are cached
+    cache = load_cache()
+    cache_key = f"email_{hashlib.md5(query.encode()).hexdigest()}"
+    
+    if cache_key in cache:
+        logger.info(f"Using cached email results for query: {query}")
+        logfire.info(f"Using cached email results for query: {query}")
+        return cache[cache_key]
     
     try:
         ctx.log.info(f"Searching emails with query: {query}")
         gmail_service = ctx.deps.gmail_service
         
-        response = gmail_service.users().messages().list(userId='me', q=query).execute()
+        # Use Archon to refine the search criteria
+        archon_client = ctx.deps.archon_client
+        prompt = EMAIL_SEARCH_PROMPT.format(query=query)
+        
+        response = await archon_client.generate(
+            model="openai:gpt-4o", 
+            prompt=prompt,
+            temperature=0.2
+        )
+        
+        search_criteria = response.get('response', '').strip()
+        
+        # Default to original query if no criteria generated
+        if not search_criteria or len(search_criteria) < 5:
+            search_criteria = query
+            
+        logger.info(f"Refined search criteria: {search_criteria}")
+        logfire.info(f"Refined search criteria: {search_criteria}")
+        
+        # Perform the search
+        response = gmail_service.users().messages().list(
+            userId='me',
+            q=search_criteria,
+            maxResults=10
+        ).execute()
+        
         messages = response.get('messages', [])
         
         results = []
@@ -105,7 +153,7 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict[str, Any]]:
             })
         
         # Cache the results
-        cache["email_searches"][cache_key] = results
+        cache[cache_key] = results
         save_cache(cache)
         
         # Store in state for UI
@@ -255,47 +303,106 @@ async def search_drive(ctx: AgentContext, folder_id: Optional[str] = None, query
     Returns:
         A list of files with id, name, and other metadata
     """
-    # Check if we have cached results
-    cache = load_cache()
-    cache_key = f"drive_{folder_id}_{query}"
+    logfire.info(f"Searching Drive folder {folder_id}")
     
-    if cache_key in cache["drive_searches"]:
-        ctx.log.info(f"Using cached results for drive search in folder {folder_id}")
-        return cache["drive_searches"][cache_key]
+    drive_service = ctx.deps.drive_service
     
-    try:
-        ctx.log.info(f"Searching Drive folder {folder_id}")
-        drive_service = ctx.deps.drive_service
-        
-        # Build the query
-        drive_query = ""
-        
-        if folder_id:
-            drive_query = f"'{folder_id}' in parents"
-        
-        if query:
-            if drive_query:
-                drive_query += f" and {query}"
-            else:
-                drive_query = query
-        
-        # If no specific query is provided, just return all files
-        response = drive_service.files().list(
-            q=drive_query if drive_query else None,
-            fields="files(id, name, mimeType, size, createdTime, modifiedTime)"
-        ).execute()
-        
-        files = response.get('files', [])
-        
-        # Cache the results
-        cache["drive_searches"][cache_key] = files
-        save_cache(cache)
-        
-        return files
+    # Generate search criteria if query provided
+    search_query = f"'{folder_id}' in parents"
     
-    except Exception as e:
-        ctx.log.error(f"Error searching Drive: {str(e)}")
-        raise ModelRetry(f"Error searching Drive: {str(e)}")
+    if query:
+        try:
+            # Use Archon to refine search criteria
+            archon_client = ctx.deps.archon_client
+            prompt = SEARCH_CRITERIA_PROMPT.format(query=query)
+            
+            response = await archon_client.generate(
+                model="openai:gpt-4o",
+                prompt=prompt,
+                temperature=0.2
+            )
+            
+            criteria = response.get('response', '').strip()
+            
+            if criteria and len(criteria) > 3:
+                search_query += f" and (name contains '{criteria}' or fullText contains '{criteria}')"
+                logger.info(f"Using refined Drive search criteria: {criteria}")
+                logfire.info(f"Using refined Drive search criteria: {criteria}")
+        except Exception as e:
+            logger.error(f"Error generating Drive search criteria: {str(e)}")
+            logfire.error(f"Error generating Drive search criteria: {str(e)}")
+            
+            # Basic fallback
+            if query:
+                search_query += f" and (name contains '{query}' or fullText contains '{query}')"
+    
+    # Perform the search
+    results = drive_service.files().list(
+        q=search_query,
+        spaces='drive',
+        fields='files(id, name, mimeType, modifiedTime, size)',
+        orderBy='modifiedTime desc',
+        pageSize=20
+    ).execute()
+    
+    files = results.get('files', [])
+    
+    # Fetch file contents for text files that could be useful for RAG
+    for file in files:
+        try:
+            # Only fetch content for text files or PDFs
+            mime_type = file.get('mimeType', '')
+            if mime_type.startswith('text/') or mime_type in [
+                'application/pdf',
+                'application/json',
+                'application/vnd.google-apps.document'
+            ]:
+                file_id = file['id']
+                
+                # Handle Google Docs differently
+                if mime_type == 'application/vnd.google-apps.document':
+                    # Export as plain text
+                    content = drive_service.files().export(
+                        fileId=file_id,
+                        mimeType='text/plain'
+                    ).execute()
+                    
+                    # For exported files, content is already bytes
+                    text_content = content.decode('utf-8', errors='replace') if isinstance(content, bytes) else content
+                    
+                else:
+                    # Download binary files
+                    content = drive_service.files().get_media(
+                        fileId=file_id
+                    ).execute()
+                    
+                    # Try to decode text files
+                    if mime_type.startswith('text/') or mime_type == 'application/json':
+                        text_content = content.decode('utf-8', errors='replace')
+                    else:
+                        # For non-text files (like PDFs), we would need special handling
+                        # This is a placeholder - real implementation would use libraries like PyPDF2
+                        text_content = f"[Binary content of type {mime_type}]"
+                
+                # Store the content in state for RAG
+                if 'drive_contents' not in ctx.deps.state:
+                    ctx.deps.state['drive_contents'] = {}
+                
+                ctx.deps.state['drive_contents'][file_id] = text_content
+                
+                # Add a snippet to the file metadata
+                if text_content:
+                    file['snippet'] = text_content[:200] + '...' if len(text_content) > 200 else text_content
+                
+                logger.info(f"Fetched content for Drive file: {file['name']}")
+                logfire.info(f"Fetched content for Drive file: {file['name']}")
+                
+        except Exception as e:
+            logger.error(f"Error fetching content for file {file.get('name', 'unknown')}: {str(e)}")
+            logfire.error(f"Error fetching content for file {file.get('name', 'unknown')}: {str(e)}")
+    
+    logfire.info(f"Found {len(files)} files in Drive")
+    return files
 
 @parallel
 async def chunk_and_embed_document(text: str, model: SentenceTransformer) -> List[Tuple[str, np.ndarray]]:
@@ -335,108 +442,168 @@ async def perform_rag(ctx: AgentContext, query: str, documents: List[str]) -> Di
     Returns:
         The RAG result with query, response, and used chunks
     """
+    logfire.info(f"Performing RAG for query: {query}")
+    
+    # Gather all text content from state
+    all_documents = list(documents)  # Start with the provided documents
+    
+    # Add email content from state if available
+    if 'email_contents' in ctx.deps.state:
+        all_documents.extend(ctx.deps.state['email_contents'].values())
+    
+    # Add document content from state if available
+    if 'document_contents' in ctx.deps.state:
+        all_documents.extend(ctx.deps.state['document_contents'].values())
+    
+    # Add Drive content from state if available
+    if 'drive_contents' in ctx.deps.state:
+        all_documents.extend(ctx.deps.state['drive_contents'].values())
+    
+    # Remove empty documents and truncate very long ones
+    filtered_documents = []
+    for doc in all_documents:
+        if doc and isinstance(doc, str):
+            # Truncate very long documents to a reasonable size
+            if len(doc) > 5000:
+                doc = doc[:5000] + "... [truncated]"
+            filtered_documents.append(doc)
+    
+    if not filtered_documents:
+        logger.warning("No valid documents available for RAG")
+        logfire.warning("No valid documents available for RAG")
+        return {
+            'query': query,
+            'response': "I don't have enough context to answer this query.",
+            'chunks_used': []
+        }
+    
+    # Load the embedding model - using the all-MiniLM-L6-v2 model
     try:
-        ctx.log.info(f"Performing RAG on {len(documents)} documents for query: {query}")
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Get the embedding model and FAISS index
-        # Use all-MiniLM-L6-v2 which outputs 768-dimensional embeddings
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        faiss_index = ctx.deps.faiss_index
+        # Generate embeddings for the documents
+        document_embeddings = embedding_model.encode(filtered_documents)
         
-        # Process documents in parallel
-        all_chunks_with_embeddings = []
-        for document in documents:
-            # Use parallelized chunking and embedding
-            chunk_embeddings = await chunk_and_embed_document(document, model)
-            all_chunks_with_embeddings.extend(chunk_embeddings)
+        # Generate embedding for the query
+        query_embedding = embedding_model.encode([query])[0]
         
-        chunks = [c for c, _ in all_chunks_with_embeddings]
-        embeddings = np.array([e for _, e in all_chunks_with_embeddings])
+        # Calculate similarities
+        similarities = np.dot(document_embeddings, query_embedding) / (
+            np.linalg.norm(document_embeddings, axis=1) * np.linalg.norm(query_embedding)
+        )
         
-        # Add to FAISS index
-        if len(embeddings) > 0:
-            faiss_index.add(embeddings)
+        # Get top 5 most relevant document chunks
+        top_indices = similarities.argsort()[-5:][::-1]
+        top_chunks = [filtered_documents[i] for i in top_indices]
         
-        # Embed the query
-        query_embedding = model.encode([query])[0]
+        # Use Archon to generate a response using the retrieved chunks
+        context = "\n\n---\n\n".join(top_chunks)
         
-        # Search for relevant chunks
-        k = min(5, len(chunks))  # Get top-5 chunks or all if fewer
-        if k > 0:
-            D, I = faiss_index.search(np.array([query_embedding]), k)
-            
-            # Get the top chunks
-            top_chunks = [chunks[i] for i in I[0]]
-            
-            # Generate response with Archon MCP
-            from agent_prompts import RAG_PROMPT
-            
-            # Keep prompt under 5k tokens to avoid Archon MCP limits
-            chunks_text = "\n\n".join([f"Chunk {i+1}:\n{chunk}" for i, chunk in enumerate(top_chunks)])
-            if len(chunks_text) > 4000:  # Leave room for the rest of the prompt
-                chunks_text = chunks_text[:4000] + "...[truncated]"
-                
-            prompt = RAG_PROMPT.format(
-                query=query,
-                chunks=chunks_text
-            )
-            
-            # Use Archon MCP to generate the response
+        # Ensure the prompt stays under 5k tokens
+        if len(context) > 4000:
+            context = context[:4000] + "... [truncated]"
+        
+        prompt = RAG_PROMPT.format(query=query, context=context)
+        
+        try:
+            # Direct MCP call using the Cursor MCP protocol
             try:
-                # In an actual implementation using Cursor's MCP protocol
                 import cursor.mcp.archon as archon_mcp
                 
-                # Create a thread if needed
-                if not hasattr(ctx.deps, 'archon_thread_id'):
-                    ctx.deps.archon_thread_id = await archon_mcp.create_thread(random_string="init")
+                # Create a thread if we don't have one
+                if not hasattr(ctx.deps.archon_client, 'thread_id') or not ctx.deps.archon_client.thread_id:
+                    thread_id = await archon_mcp.create_thread(random_string="init")
+                    ctx.deps.archon_client.thread_id = thread_id
                 
-                # Run the agent
+                # Run the agent with the generated prompt
                 response_text = await archon_mcp.run_agent(
-                    thread_id=ctx.deps.archon_thread_id,
+                    thread_id=ctx.deps.archon_client.thread_id,
                     user_input=prompt
                 )
-            except Exception as archon_err:
-                ctx.log.error(f"Error using Archon MCP: {str(archon_err)}")
-                # Use the ArchonClient directly as fallback
+                
+            except ImportError:
+                # Fall back to the client's generate method
                 response = await ctx.deps.archon_client.generate(
-                    model="openai:gpt-4o",
+                    model="openai:gpt-4o", 
                     prompt=prompt,
-                    temperature=0.2,
-                    max_tokens=1000
+                    temperature=0.5,
+                    max_tokens=500
                 )
-                response_text = response.get('response', 'No response generated')
+                response_text = response.get('response', '')
             
-            # Store in Supabase
+            # Store the result in the database
             try:
-                result = {
+                rag_result = {
                     'query': query,
                     'response': response_text,
-                    'chunks_used': len(top_chunks),
+                    'chunks_used': top_chunks,
                     'timestamp': datetime.now().isoformat()
                 }
                 
-                supabase = ctx.deps.supabase
-                await supabase.table('rag_results').insert(result).execute()
-            except Exception as db_err:
-                ctx.log.error(f"Error storing RAG result in Supabase: {str(db_err)}")
+                # Use direct MCP for Supabase insert
+                try:
+                    import cursor.mcp.supabase as supabase_mcp
+                    
+                    await supabase_mcp.insert('rag_results', {
+                        'query': query,
+                        'result': response_text,
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    
+                    logger.info("Stored RAG result in Supabase")
+                    logfire.info("Stored RAG result in Supabase")
+                    
+                except ImportError:
+                    # Fall back to Supabase client
+                    if ctx.deps.supabase:
+                        await ctx.deps.supabase.table('rag_results').insert({
+                            'query': query,
+                            'result': response_text,
+                            'timestamp': datetime.now().isoformat()
+                        }).execute()
+                        
+                        logger.info("Stored RAG result in Supabase")
+                        logfire.info("Stored RAG result in Supabase")
+                
+            except Exception as e:
+                logger.error(f"Error storing RAG result in database: {str(e)}")
+                logfire.error(f"Error storing RAG result in database: {str(e)}")
+                
+                # Create a backup file
+                os.makedirs('cache/rag_results', exist_ok=True)
+                backup_file = f"cache/rag_results/rag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                
+                with open(backup_file, 'w') as f:
+                    json.dump(rag_result, f, indent=2)
+                
+                logger.info(f"Saved RAG result to backup file: {backup_file}")
+                logfire.info(f"Saved RAG result to backup file: {backup_file}")
+            
+            return rag_result
+            
+        except Exception as e:
+            error_msg = f"Error generating RAG response: {str(e)}"
+            logger.error(error_msg)
+            logfire.error(error_msg)
             
             return {
                 'query': query,
-                'response': response_text,
+                'response': "Error generating response. Please try again.",
                 'chunks_used': top_chunks,
-                'status': 'success'
+                'error': str(e)
             }
-        else:
-            return {
-                'query': query,
-                'response': 'No relevant information found for this query.',
-                'chunks_used': [],
-                'status': 'no_chunks'
-            }
-    
+            
     except Exception as e:
-        ctx.log.error(f"Error performing RAG: {str(e)}")
-        raise ModelRetry(f"Error performing RAG: {str(e)}")
+        error_msg = f"Error in RAG processing: {str(e)}"
+        logger.error(error_msg)
+        logfire.error(error_msg)
+        
+        return {
+            'query': query,
+            'response': "Error processing documents. Please try again.",
+            'chunks_used': [],
+            'error': str(e)
+        }
 
 @tool("track_progress")
 async def track_progress(
