@@ -27,7 +27,7 @@ This project uses Cursor MCP for:
 ## History
 
 - Pushed initial commits on March 21, 2025 via Cursor Git integration
-- GitHub: https://github.com/techevo-user/Techevo-RAG
+- GitHub: https://github.com/TimothiousAI/Techevo-RAG
 
 ## Testing
 
@@ -99,10 +99,12 @@ As the GitHub MCP integration requires authentication, please follow these manua
 1. Create a new private repository on GitHub named "Techevo-RAG"
 2. Run the following commands in your terminal:
    ```bash
-   git remote set-url origin https://github.com/YOUR_USERNAME/Techevo-RAG.git
+   git remote set-url origin https://github.com/TimothiousAI/Techevo-RAG.git
    git push -u origin master
    ```
 3. Enter your GitHub credentials when prompted
+
+**GitHub:** [Techevo-RAG](https://github.com/TimothiousAI/Techevo-RAG) | **Version:** 1.0.0
 
 ## Example Queries
 

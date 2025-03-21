@@ -493,7 +493,7 @@ st.markdown("---")
 st.markdown("""
 **Instructions:** Run with `streamlit run streamlit_app.py --server.port 8502`
 
-**GitHub:** [Techevo-RAG](https://github.com/yourusername/Techevo-RAG) | **Version:** 1.0.0
+**GitHub:** [Techevo-RAG](https://github.com/TimothiousAI/Techevo-RAG) | **Version:** 1.0.0
 """)
 
 # Exit handler
