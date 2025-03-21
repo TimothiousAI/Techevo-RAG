@@ -193,18 +193,20 @@ class ArchonClient:
             logger.error(f"Traceback: {traceback.format_exc()}")
             
             try:
-                # Fallback to local OpenAI API
-                response = await self.session.post(
-                    "/chat/completions",
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        **kwargs
-                    }
+                # Fallback to OpenAI API using AsyncOpenAI
+                from openai import AsyncOpenAI
+                client = AsyncOpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+                
+                # Convert model name format if needed (e.g., gpt-4o -> gpt-4o-mini)
+                model_name = model.split(':')[-1] if ':' in model else model
+                
+                completion = await client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    **kwargs
                 )
-                response.raise_for_status()
-                result = response.json()
-                return {'response': result["choices"][0]["message"]["content"]}
+                
+                return {'response': completion.choices[0].message.content}
             except Exception as fallback_error:
                 logger.error(f"Fallback API also failed: {fallback_error}")
                 logger.error(f"Traceback: {traceback.format_exc()}")
@@ -297,35 +299,25 @@ async def setup_google_services() -> Tuple[Any, Any]:
     
     return gmail_service, drive_service
 
-async def create_faiss_index(docs: List[str]) -> tuple:
-    """Create FAISS index for the provided documents.
+def create_faiss_index(dimension=768):
+    """Create an empty FAISS index with the specified dimension.
     
     Args:
-        docs: List of document strings
+        dimension: Vector dimension (768 for all-MiniLM-L6-v2)
         
     Returns:
-        tuple: (FAISS index, document embeddings, model)
+        FAISS index object
     """
-    logger.info(f"Creating FAISS index for {len(docs)} documents")
+    logger.info(f"Creating FAISS index with dimension {dimension}")
     
     try:
-        # Use all-MiniLM-L6-v2 model which provides 384-dimensional embeddings
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        dimension = 384  # For all-MiniLM-L6-v2
-        
-        # Create embeddings
-        embeddings = model.encode(docs)
-        
         # Create FAISS index
         index = faiss.IndexFlatL2(dimension)
-        index.add(embeddings)
-        
-        logger.info(f"FAISS index created with {index.ntotal} vectors of dimension {dimension}")
-        return index, embeddings, model
+        return index
     except Exception as e:
-        logger.error(f"Failed to create FAISS index: {e}")
+        logger.error(f"Error creating FAISS index: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+        raise e
 
 async def predict_intent(query: str, archon_client: ArchonClient) -> List[str]:
     """

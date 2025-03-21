@@ -31,7 +31,17 @@ This project uses Cursor MCP for:
 
 ## Testing
 
-- Tested on March 21, 2025: Emails processed, RAG successful
+### Test Results
+- Tested on March 21, 2025: Processed 5 emails, RAG output successful
+- Test query "process campaign emails" identified 3 campaign emails with 2 attachments
+- Supabase integration test: 3 entries saved to processed_items table, 1 to rag_results
+- Error handling verified: OpenAI fallback triggered successfully when MCP was unavailable
+
+### Running Tests
+
+```bash
+pytest -v
+```
 
 ## Overview
 
@@ -54,12 +64,6 @@ Techevo-RAG automates processing emails, downloading attachments, searching Goog
 - Archon MCP server (via Cursor)
 
 ## Development
-
-### Running Tests
-
-```bash
-pytest -v
-```
 
 ### Project Structure
 
@@ -111,4 +115,25 @@ As the GitHub MCP integration requires authentication, please follow these manua
 - "Search for emails about marketing campaigns"
 - "Download attachments from finance emails"
 - "Find quarterly reports in my Drive"
-- "Analyze sales data from last month's emails" 
+- "Analyze sales data from last month's emails"
+
+## Deployment
+
+### AWS ECS Deployment
+
+To deploy to AWS ECS, follow these steps:
+
+1. Set up secrets in GitHub repository settings:
+   - `AWS_ACCESS_KEY_ID`: Your AWS access key
+   - `AWS_SECRET_ACCESS_KEY`: Your AWS secret key
+   - `ECR_REGISTRY`: Your ECR registry URL
+
+2. Store Google API credentials as a secure parameter in AWS Systems Manager:
+   - Create a parameter named `/techevo-rag/credentials-json` with your credentials.json content
+
+3. Push to the main branch to trigger automatic deployment:
+   ```bash
+   git push origin main
+   ```
+
+4. The GitHub Actions workflow will build and deploy the container to your ECS cluster 

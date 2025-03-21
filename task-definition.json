@@ -1,0 +1,52 @@
+{
+  "family": "techevo-rag",
+  "networkMode": "awsvpc",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "techevo-rag",
+      "image": "${ECR_REGISTRY}/techevo-rag:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8502,
+          "hostPort": 8502,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/techevo-rag",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "environment": [
+        {
+          "name": "SUPABASE_URL",
+          "value": "${SUPABASE_URL}"
+        },
+        {
+          "name": "SUPABASE_KEY",
+          "value": "${SUPABASE_KEY}"
+        },
+        {
+          "name": "OPENAI_API_KEY",
+          "value": "${OPENAI_API_KEY}"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "CREDENTIALS_JSON",
+          "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/techevo-rag/credentials-json"
+        }
+      ]
+    }
+  ],
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "1024",
+  "memory": "2048"
+} 
