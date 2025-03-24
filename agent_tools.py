@@ -18,6 +18,7 @@ import io
 import base64
 from sentence_transformers import SentenceTransformer
 import faiss
+import numpy as np
 
 from agent_prompts import (
     RAG_PROMPT, 
@@ -33,6 +34,21 @@ logger = logfire.configure()
 CACHE_DIR = Path('cache')
 CACHE_DIR.mkdir(exist_ok=True)
 CACHE_FILE = CACHE_DIR / 'search_results.json'
+
+class AgentContext:
+    """Context for agent tool functions."""
+    
+    def __init__(self, agent, deps, log=None):
+        """Initialize agent context.
+        
+        Args:
+            agent: The agent instance
+            deps: Dependencies including services and state
+            log: Logger instance (defaults to module logger)
+        """
+        self.agent = agent
+        self.deps = deps
+        self.log = log or logger
 
 def load_cache():
     """Load cached email and drive search results."""
@@ -457,238 +473,328 @@ async def search_drive(query: str, services: Dict, deps) -> List[Dict]:
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
-async def perform_rag(query: str, services: Dict, deps) -> Dict:
+async def perform_rag(ctx, query: str, documents: List[str]) -> Dict[str, Any]:
     """
-    Perform RAG operation on documents from emails, attachments, and Drive files.
+    Perform RAG operation on documents.
     
     Args:
+        ctx: Agent context containing deps and logger
         query: The user query
-        services: Dict containing initialized services
-        deps: Dependencies object with state
+        documents: List of documents to process
         
     Returns:
         RAG operation result
     """
-    archon = services.get('archon')
-    supabase = services.get('supabase')
-    
-    if not archon:
-        logger.error("Archon client not initialized")
-        raise ValueError("Archon client not initialized")
-    
     try:
-        # Gather context from various sources
-        context = []
-        logger.info("Gathering context for RAG")
+        ctx.log.info(f"Performing RAG on {len(documents)} documents for query: {query}")
         
-        # 1. Emails
-        if hasattr(deps, 'state') and 'processed_emails' in deps.state:
-            for email in deps.state['processed_emails']:
-                # Use full body for better context
-                if email.get('body'):
-                    context.append(f"EMAIL: {email['subject']}\nFROM: {email['from']}\nDATE: {email['date']}\n\n{email['body']}")
-                else:
-                    context.append(f"EMAIL: {email['subject']}\nFROM: {email['from']}\nDATE: {email['date']}\n\n{email['snippet']}")
-        
-        # 2. Attachments content
-        if hasattr(deps, 'state') and 'attachments_content' in deps.state:
-            for filename, content in deps.state['attachments_content'].items():
-                if isinstance(content, bytes):
-                    # Try to decode bytes to string
-                    try:
-                        text_content = content.decode('utf-8', errors='ignore')
-                        context.append(f"ATTACHMENT: {filename}\n\n{text_content[:2000]}...")
-                    except:
-                        logger.warning(f"Could not decode attachment {filename} as text")
-        
-        # 3. Drive files
-        if hasattr(deps, 'state') and 'drive_contents' in deps.state:
-            for file_id, content in deps.state['drive_contents'].items():
-                if content:
-                    context.append(f"DRIVE FILE: {file_id}\n\n{content[:2000]}...")
-        
-        # If no context gathered, use a placeholder
-        if not context:
-            logger.warning("No context found for RAG, using placeholder")
-            context = ["No relevant context found."]
-        
-        # Log content size for debugging
-        total_content_size = sum(len(c) for c in context)
-        logger.info(f"Total context size: {total_content_size} characters")
-        
-        # Perform embedding-based retrieval
+        # Ensure we have the model loaded
         try:
-            # Create embeddings
             model = SentenceTransformer('all-MiniLM-L6-v2')
-            
-            # Create FAISS index
-            query_embedding = model.encode([query])[0]
-            context_embeddings = model.encode(context)
-            
-            dimension = len(query_embedding)
-            index = faiss.IndexFlatL2(dimension)
-            index.add(context_embeddings)
-            
-            # Search for most similar documents
-            k = min(5, len(context))  # Get up to 5 results
-            distances, indices = index.search(query_embedding.reshape(1, -1), k)
-            
-            # Get the top results
-            top_contexts = [context[idx] for idx in indices[0]]
-            
-            # Combine into a single context string (with truncation if needed)
-            combined_context = "\n\n---\n\n".join(top_contexts)
-            
-            # Truncate if too long (to stay within context limits)
-            if len(combined_context) > 3000:
-                logger.warning(f"Context too large ({len(combined_context)} chars), truncating")
-                combined_context = combined_context[:3000] + "...[truncated]"
+            ctx.log.info("Loaded SentenceTransformer model")
         except Exception as e:
-            logger.error(f"Error in embedding-based retrieval: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            combined_context = "\n\n".join(context[:3])  # Fallback to first 3 contexts
+            ctx.log.error(f"Error loading SentenceTransformer: {str(e)}")
+            raise ValueError(f"Failed to load embedding model: {str(e)}")
         
-        # Generate RAG response
-        logger.info("Generating RAG response with context")
-        rag_prompt = RAG_PROMPT.format(query=query, context=combined_context)
+        # Get or create FAISS index
+        faiss_index = ctx.deps.faiss_index
+        if faiss_index is None:
+            ctx.log.warning("FAISS index not found in deps, creating new one")
+            try:
+                import faiss
+                faiss_index = faiss.IndexFlatL2(768)  # dimension for all-MiniLM-L6-v2
+                ctx.deps.faiss_index = faiss_index
+            except Exception as e:
+                ctx.log.error(f"Error creating FAISS index: {str(e)}")
+                raise ValueError(f"Failed to create FAISS index: {str(e)}")
         
-        # Make sure prompt isn't too large for Archon MCP (5k token limit)
-        if len(rag_prompt) > 5000:
-            logger.warning(f"RAG prompt too large ({len(rag_prompt)} chars), truncating")
-            context_limit = 5000 - len(RAG_PROMPT.format(query=query, context=""))
-            combined_context = combined_context[:context_limit] + "...[truncated]"
-            rag_prompt = RAG_PROMPT.format(query=query, context=combined_context)
+        all_chunks_with_embeddings = []
         
-        # Call Archon MCP
-        try:
-            if not archon.thread_id:
-                archon.thread_id = await archon.create_thread()
-            
-            rag_response = await archon.run_agent(
-                thread_id=archon.thread_id,
-                user_input=rag_prompt
-            )
-            
-            if isinstance(rag_response, dict) and 'error' in rag_response:
-                logger.error(f"Error from Archon MCP: {rag_response['error']}")
+        # Chunk and embed documents
+        for doc_idx, document in enumerate(documents):
+            try:
+                # Skip empty or invalid documents
+                if not document or not isinstance(document, str):
+                    ctx.log.warning(f"Skipping invalid document at index {doc_idx}")
+                    continue
+                    
+                # Helper function to chunk a document and generate embeddings
+                async def chunk_and_embed_document(doc, model):
+                    chunks = []
+                    # Simple chunking by splitting on paragraphs with reasonable size
+                    paragraphs = doc.split('\n\n')
+                    for i, para in enumerate(paragraphs):
+                        if para.strip():
+                            # Further chunk long paragraphs
+                            if len(para) > 1000:
+                                sentences = para.split('. ')
+                                for j in range(0, len(sentences), 5):
+                                    chunk = '. '.join(sentences[j:j+5])
+                                    if chunk.strip():
+                                        chunks.append(chunk)
+                            else:
+                                chunks.append(para)
+                    
+                    ctx.log.info(f"Created {len(chunks)} chunks from document")
+                    
+                    # Generate embeddings for chunks
+                    try:
+                        embeddings = model.encode(chunks)
+                        return [(chunks[i], embeddings[i]) for i in range(len(chunks))]
+                    except Exception as e:
+                        ctx.log.error(f"Error encoding chunks: {str(e)}")
+                        # Try with smaller batches if we hit out of memory
+                        result = []
+                        batch_size = 10
+                        for i in range(0, len(chunks), batch_size):
+                            batch = chunks[i:i+batch_size]
+                            batch_embeddings = model.encode(batch)
+                            result.extend([(batch[j], batch_embeddings[j]) for j in range(len(batch))])
+                        return result
                 
-                # Fallback to local API
-                fallback_response = await archon.generate(
-                    model="gpt-4o",
-                    prompt=rag_prompt
+                chunk_embeddings = await chunk_and_embed_document(document, model)
+                all_chunks_with_embeddings.extend(chunk_embeddings)
+                ctx.log.info(f"Processed document {doc_idx+1}/{len(documents)}")
+                
+            except Exception as e:
+                ctx.log.error(f"Error processing document {doc_idx}: {str(e)}")
+                ctx.log.error(traceback.format_exc())
+                # Continue with other documents
+        
+        # Check if we have any chunks
+        if not all_chunks_with_embeddings:
+            ctx.log.warning("No valid chunks extracted from documents")
+            return {
+                'query': query,
+                'response': 'I could not extract any useful information from the provided documents.',
+                'chunks_used': [],
+                'status': 'no_chunks'
+            }
+        
+        chunks = [c for c, _ in all_chunks_with_embeddings]
+        embeddings = np.array([e for _, e in all_chunks_with_embeddings])
+        
+        # Add embeddings to FAISS index
+        if len(embeddings) > 0:
+            try:
+                faiss_index.add(embeddings)
+                ctx.log.info(f"Added {len(embeddings)} embeddings to FAISS index")
+            except Exception as e:
+                ctx.log.error(f"Error adding embeddings to FAISS index: {str(e)}")
+                ctx.log.error(traceback.format_exc())
+                # Continue with search using just the current embeddings
+        
+        # Query the index
+        try:
+            query_embedding = model.encode([query])[0]
+            k = min(5, len(chunks))  # Number of chunks to retrieve
+            
+            if k > 0:
+                # Perform search
+                D, I = faiss_index.search(np.array([query_embedding]), k)
+                top_chunks = [chunks[i] for i in I[0]]
+                ctx.log.info(f"Retrieved {len(top_chunks)} chunks from FAISS search")
+                
+                # Create prompt with retrieved chunks
+                from agent_prompts import RAG_PROMPT
+                chunks_text = "\n\n".join([f"Chunk {i+1}:\n{chunk}" for i, chunk in enumerate(top_chunks)])
+                
+                # Truncate if too long
+                if len(chunks_text) > 4000:
+                    ctx.log.warning("Chunks text too long, truncating")
+                    chunks_text = chunks_text[:4000] + "...[truncated]"
+                
+                prompt = RAG_PROMPT.format(
+                    query=query,
+                    chunks=chunks_text
                 )
                 
-                if 'error' in fallback_response:
-                    raise ValueError(f"Both MCP and fallback failed: {fallback_response['error']}")
+                # Use OpenAI directly
+                ctx.log.info("Sending prompt to OpenAI for RAG generation")
+                try:
+                    from openai import AsyncOpenAI
+                    openai_api_key = os.getenv('OPENAI_API_KEY')
+                    if not openai_api_key:
+                        raise ValueError("OPENAI_API_KEY environment variable not set")
+                        
+                    client = AsyncOpenAI(api_key=openai_api_key)
+                    completion = await client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2,
+                        max_tokens=1000
+                    )
+                    response_text = completion.choices[0].message.content
+                    ctx.log.info("Successfully generated RAG response")
+                    
+                except Exception as e:
+                    ctx.log.error(f"OpenAI API error: {str(e)}")
+                    ctx.log.error(traceback.format_exc())
+                    
+                    # Try fallback to Archon
+                    ctx.log.info("Attempting fallback to Archon")
+                    try:
+                        archon = ctx.deps.archon_client
+                        if archon:
+                            archon_response = await archon.generate(
+                                model="gpt-4o",
+                                prompt=prompt
+                            )
+                            response_text = archon_response.get('response', 'Failed to generate response')
+                            ctx.log.info("Successfully generated RAG response via Archon fallback")
+                        else:
+                            response_text = "Error generating response. OpenAI API error and Archon not available."
+                    except Exception as e2:
+                        ctx.log.error(f"Archon fallback also failed: {str(e2)}")
+                        response_text = f"Error generating response: {str(e)}. Fallback also failed."
                 
-                rag_result = fallback_response['response']
-            elif isinstance(rag_response, str):
-                rag_result = rag_response
+                # Store result in Supabase
+                try:
+                    supabase = ctx.deps.supabase
+                    if supabase:
+                        result = {
+                            'query': query,
+                            'response': response_text,
+                            'chunks_used': len(top_chunks),
+                            'timestamp': datetime.now().isoformat()
+                        }
+                        
+                        await supabase.table('rag_results').insert(result).execute()
+                        ctx.log.info("RAG result stored in Supabase")
+                    else:
+                        ctx.log.warning("Supabase client not available, RAG result not stored")
+                except Exception as e:
+                    ctx.log.error(f"Failed to store RAG result in Supabase: {str(e)}")
+                    # Fallback to local storage
+                    try:
+                        os.makedirs('cache', exist_ok=True)
+                        with open(f"cache/rag_result_{int(time.time())}.json", 'w') as f:
+                            json.dump({
+                                'query': query,
+                                'response': response_text,
+                                'chunks_used': len(top_chunks),
+                                'timestamp': datetime.now().isoformat()
+                            }, f)
+                        ctx.log.info("RAG result stored locally")
+                    except Exception as e2:
+                        ctx.log.error(f"Local storage also failed: {str(e2)}")
+                
+                return {
+                    'query': query,
+                    'response': response_text,
+                    'chunks_used': top_chunks,
+                    'status': 'success'
+                }
             else:
-                rag_result = rag_response.get('text', str(rag_response))
-            
+                ctx.log.warning("No chunks available for search")
+                return {
+                    'query': query,
+                    'response': 'No relevant information found for this query.',
+                    'chunks_used': [],
+                    'status': 'no_chunks'
+                }
         except Exception as e:
-            logger.error(f"Error generating RAG response: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            rag_result = f"Error generating response: {str(e)}"
-        
-        # Store RAG result in Supabase
-        try:
-            logger.info("Storing RAG result in Supabase")
-            
-            # Prepare record
-            result = {
+            ctx.log.error(f"Error during FAISS search: {str(e)}")
+            ctx.log.error(traceback.format_exc())
+            return {
                 'query': query,
-                'result': rag_result,
-                'timestamp': datetime.now().isoformat()
+                'response': f'Error during document search: {str(e)}',
+                'chunks_used': [],
+                'status': 'search_error'
             }
             
-            # Store in Supabase
-            for attempt in range(3):  # Retry up to 3 times
-                try:
-                    db_result = supabase.table('rag_results').insert(result).execute()
-                    logger.info(f"RAG result stored in Supabase: {db_result}")
-                    break
-                except Exception as retry_error:
-                    if attempt < 2:  # Only retry on first two attempts
-                        logger.warning(f"Retrying Supabase insert (attempt {attempt+1}): {retry_error}")
-                        await asyncio.sleep(1)
-                    else:
-                        # On final attempt, backup to local file
-                        raise
-        except Exception as storage_error:
-            logger.error(f"Error storing RAG result: {storage_error}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            # Backup to local file
-            try:
-                os.makedirs('logs/rag_results', exist_ok=True)
-                backup_file = f"logs/rag_results/{int(time.time())}.json"
-                with open(backup_file, 'w') as f:
-                    json.dump(result, f)
-                logger.info(f"RAG result backed up to {backup_file}")
-            except Exception as backup_error:
-                logger.error(f"Error backing up RAG result: {backup_error}")
-        
-        return {
-            'status': 'success',
-            'result': rag_result,
-            'context_size': len(context)
-        }
-    
     except Exception as e:
-        logger.error(f"Error in perform_rag: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+        ctx.log.error(f"Error performing RAG: {str(e)}")
+        ctx.log.error(traceback.format_exc())
+        return {
+            'query': query,
+            'response': f'Error performing RAG: {str(e)}',
+            'status': 'error'
+        }
 
-async def track_progress(record: Dict, services: Dict) -> Dict:
+async def track_progress(ctx, email_id: str, file_hash: str, status: str, file_id: Optional[str] = None, filename: Optional[str] = None, error_message: Optional[str] = None) -> Dict[str, Any]:
     """
     Track progress in Supabase.
     
     Args:
-        record: Progress record to store
-        services: Dict containing initialized services
+        ctx: Agent context containing deps and logger
+        email_id: ID of the processed email
+        file_hash: Hash of the processed file
+        status: Status of the operation
+        file_id: Optional Drive file ID
+        filename: Optional filename
+        error_message: Optional error message
         
     Returns:
         Result of the storage operation
     """
-    supabase = services.get('supabase')
-    
-    if not supabase:
-        logger.error("Supabase client not initialized")
-        raise ValueError("Supabase client not initialized")
-    
     try:
-        logger.info(f"Tracking progress: {record}")
-        
-        # Add timestamp if not present
-        if 'timestamp' not in record:
-            record['timestamp'] = datetime.now().isoformat()
+        ctx.log.info(f"Tracking progress for {filename} ({file_hash}): {status}")
+        supabase = ctx.deps.supabase
+        record = {
+            'email_id': email_id,
+            'file_hash': file_hash,
+            'status': status,
+            'timestamp': datetime.now().isoformat()
+        }
+        if file_id:
+            record['file_id'] = file_id
+        if filename:
+            record['filename'] = filename
+        if error_message:
+            record['error_message'] = error_message
             
-        # Use direct Supabase client
-        for attempt in range(3):  # Retry up to 3 times
-            try:
-                result = supabase.table('processed_items').insert(record).execute()
-                logger.info(f"Progress record stored in Supabase: {result}")
-                return result.data
-            except Exception as retry_error:
-                if attempt < 2:  # Only retry on first two attempts
-                    logger.warning(f"Retrying Supabase insert (attempt {attempt+1}): {retry_error}")
-                    await asyncio.sleep(1)
-                else:
-                    raise  # Re-raise the exception on the last attempt
-    except Exception as e:
-        logger.error(f"Error tracking progress: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        
-        # Backup to local file
-        try:
-            os.makedirs('logs/progress', exist_ok=True)
-            backup_file = f"logs/progress/{int(time.time())}.json"
-            with open(backup_file, 'w') as f:
+        # Handle missing Supabase client
+        if not supabase:
+            ctx.log.warning("Supabase client not initialized, storing record locally")
+            local_path = Path(f'cache/track_{int(time.time())}_{file_hash[:8]}.json')
+            with open(local_path, 'w') as f:
                 json.dump(record, f)
-            logger.info(f"Progress record backed up to {backup_file}")
-            return {"status": "backed up locally", "file": backup_file}
-        except Exception as backup_error:
-            logger.error(f"Error backing up progress record: {backup_error}")
-            return {"status": "error", "error": str(e), "backup_error": str(backup_error)} 
+            return {**record, 'stored': 'local', 'path': str(local_path)}
+            
+        # Try with retry mechanism
+        for attempt in range(3):
+            try:
+                result = await supabase.table('processed_items').insert(record).execute()
+                ctx.log.info(f"Progress tracked successfully after {attempt+1} attempt(s)")
+                return {**record, 'stored': 'supabase', 'data': result.data}
+            except Exception as e:
+                ctx.log.warning(f"Supabase insert attempt {attempt+1} failed: {str(e)}")
+                if attempt < 2:
+                    await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+                else:
+                    # Final fallback to local storage
+                    ctx.log.warning("All Supabase attempts failed, storing record locally")
+                    local_path = Path(f'cache/track_{int(time.time())}_{file_hash[:8]}.json')
+                    with open(local_path, 'w') as f:
+                        json.dump(record, f)
+                    return {**record, 'stored': 'local', 'path': str(local_path), 'error': str(e)}
+        
+    except Exception as e:
+        ctx.log.error(f"Failed to track progress: {str(e)}")
+        # Emergency local backup
+        try:
+            backup_path = Path(f'cache/track_error_{int(time.time())}_{file_hash[:8]}.json')
+            with open(backup_path, 'w') as f:
+                json.dump({
+                    'email_id': email_id,
+                    'file_hash': file_hash,
+                    'status': status,
+                    'timestamp': datetime.now().isoformat(),
+                    'error': str(e)
+                }, f)
+            return {
+                'status': 'error',
+                'error': str(e),
+                'email_id': email_id,
+                'file_hash': file_hash,
+                'backup_path': str(backup_path)
+            }
+        except:
+            # Last resort
+            return {
+                'status': 'error',
+                'error': str(e),
+                'email_id': email_id,
+                'file_hash': file_hash
+            } 

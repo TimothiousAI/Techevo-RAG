@@ -559,8 +559,24 @@ class TechevoRagAgent:
         for service in required_services:
             if service not in self.services:
                 logger.warning(f"Missing required service: {service}")
+        
+        # Define available tools
+        self.available_tools = {
+            'search_emails': agent_tools.search_emails,
+            'download_attachment': agent_tools.download_attachment,
+            'search_drive': agent_tools.search_drive,
+            'perform_rag': agent_tools.perform_rag
+        }
+        
+        # Dictionary to track created sub-agents and their skills
+        self.sub_agents = {}
+        
+        # Services initialization timestamp
+        self.initialized_at = datetime.now().isoformat()
+        
+        logger.info(f"Agent initialized with services: {', '.join(self.services.keys())}")
     
-    async def run_workflow(self, query: str, deps=None):
+    async def run_workflow(self, query: str, deps: EnhancedDeps) -> Dict[str, Any]:
         """Run the main agent workflow based on the query.
         
         Args:
@@ -570,138 +586,297 @@ class TechevoRagAgent:
         Returns:
             dict: Result of the workflow execution
         """
+        started_at = time.time()
         try:
-            # Initialize state if not provided
-            if not deps or not hasattr(deps, 'state'):
-                from collections import defaultdict
-                deps = type('obj', (object,), {'state': defaultdict(dict)})
-            
-            # Create new thread if needed
-            if not self.services['archon'].thread_id:
-                try:
-                    self.services['archon'].thread_id = await self.services['archon'].create_thread()
-                except Exception as e:
-                    logger.error(f"Failed to create thread: {e}")
-            
-            # Step 1: Predict intent
-            logger.info(f"Processing query: {query}")
-            from agent_prompts import INTENT_PROMPT
-            
-            intent_result = None
-            retry_count = 0
-            max_retries = 3
-            
-            while retry_count < max_retries and not intent_result:
-                try:
-                    intent_prompt = INTENT_PROMPT.format(query=query)
-                    intent_response = await self.services['archon'].generate(
-                        model="gpt-4o", 
-                        prompt=intent_prompt
-                    )
-                    
-                    if 'error' in intent_response:
-                        logger.error(f"Intent prediction error: {intent_response['error']}")
-                        retry_count += 1
-                        await asyncio.sleep(1)
-                        continue
-                    
-                    intent_result = intent_response.get('response', '')
-                    logger.info(f"Intent prediction: {intent_result}")
-                except Exception as e:
-                    logger.error(f"Intent prediction failed: {e}")
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    retry_count += 1
-                    await asyncio.sleep(1)
-            
-            if not intent_result:
-                return {
-                    'error': f"Failed to predict intent after {max_retries} retries",
-                    'tool': 'intent_prediction'
-                }
-            
-            # Parse intent result
-            try:
-                import re
-                tools_match = re.search(r'tools\s*:\s*\[(.*?)\]', intent_result, re.IGNORECASE | re.DOTALL)
-                if tools_match:
-                    tools_str = tools_match.group(1)
-                    tools = [t.strip(' "\'') for t in tools_str.split(',')]
-                else:
-                    tools = []
-                
-                logger.info(f"Selected tools: {tools}")
-            except Exception as e:
-                logger.error(f"Failed to parse intent: {e}")
-                logger.error(f"Intent result: {intent_result}")
-                return {
-                    'error': f"Failed to parse intent: {str(e)}",
-                    'tool': 'intent_parsing'
-                }
-            
-            # Step 2: Execute tools based on intent
-            from agent_tools import (
-                search_emails, download_attachment,
-                search_drive, perform_rag, track_progress
-            )
-            
-            result = {
+            # Initialize state
+            deps.state = {
                 'query': query,
-                'intent': intent_result,
-                'tools_used': tools,
-                'results': {},
+                'processed_emails': [],
+                'downloaded_attachments': [],
+                'rag_results': [],
+                'start_time': started_at
             }
             
-            # Execute each tool
-            for tool in tools:
+            # Create new thread if needed
+            if not self.services.get('archon') or not self.services['archon'].thread_id:
                 try:
-                    if tool == 'search_emails':
-                        logger.info("Executing tool: search_emails")
-                        emails = await search_emails(query, self.services, deps)
-                        result['results']['emails'] = emails
-                        
-                    elif tool == 'download_attachment':
-                        logger.info("Executing tool: download_attachment")
-                        attachments = await download_attachment(query, self.services, deps)
-                        result['results']['attachments'] = attachments
-                        
-                    elif tool == 'search_drive':
-                        logger.info("Executing tool: search_drive")
-                        files = await search_drive(query, self.services, deps)
-                        result['results']['drive_files'] = files
-                        
-                    elif tool == 'perform_rag':
-                        logger.info("Executing tool: perform_rag")
-                        rag_result = await perform_rag(query, self.services, deps)
-                        result['results']['rag'] = rag_result
+                    if 'archon' in self.services:
+                        self.services['archon'].thread_id = await self.services['archon'].create_thread()
+                    else:
+                        logger.error("Archon service not available")
                 except Exception as e:
-                    logger.error(f"Tool execution failed for {tool}: {e}")
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    result['error'] = f"Tool execution failed: {str(e)}"
-                    result['tool'] = tool
-                    # Continue with other tools despite error
+                    logger.error(f"Failed to create Archon thread: {e}")
+                    logger.error(traceback.format_exc())
             
-            # Step 3: Track progress
+            logger.info(f"Predicting intent for query: {query}")
+            intent_tools = []
+            
+            if 'archon' in self.services:
+                intent_tools = await predict_intent(query, self.services['archon'])
+                logger.info(f"Predicted tools via Archon: {intent_tools}")
+            else:
+                # Fallback without Archon
+                logger.warning("Archon service not available, using default intent prediction")
+                
+                # Simple keyword-based tool selection
+                intent_tools = []
+                if 'email' in query.lower() or 'mail' in query.lower():
+                    intent_tools.append('search_emails')
+                if 'attachment' in query.lower() or 'download' in query.lower() or 'file' in query.lower():
+                    intent_tools.append('download_attachment')
+                if 'drive' in query.lower() or 'document' in query.lower():
+                    intent_tools.append('search_drive')
+                if 'process' in query.lower() or 'analyze' in query.lower() or 'summarize' in query.lower():
+                    intent_tools.append('perform_rag')
+                
+                # Always include search_emails and perform_rag as fallback
+                if not intent_tools or len(intent_tools) == 0:
+                    intent_tools = ['search_emails', 'perform_rag']
+                
+                logger.info(f"Predicted tools via fallback: {intent_tools}")
+            
+            result = {
+                'status': 'success',
+                'data': {},
+                'query': query,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Check if any tools are missing and create new sub-agents if needed
+            missing_tools = [tool for tool in intent_tools if tool not in self.available_tools]
+            if missing_tools:
+                logger.info(f"Missing tools: {missing_tools}. Attempting to create new sub-agent...")
+                
+                # Determine skills based on missing tools
+                skills = []
+                for tool in missing_tools:
+                    if 'search' in tool.lower():
+                        skills.append("searching")
+                    elif 'download' in tool.lower():
+                        skills.append("file_download")
+                    elif 'rag' in tool.lower() or 'process' in tool.lower():
+                        skills.append("rag_processing")
+                    else:
+                        skills.append("general_processing")
+                
+                # Create a new sub-agent with Archon MCP
+                try:
+                    if 'archon' in self.services:
+                        agent_id = await self.services['archon'].create_agent(
+                            skills=list(set(skills)),  # Remove duplicates 
+                            level="sub-agent"
+                        )
+                        logger.info(f"Created new sub-agent with ID: {agent_id}")
+                        
+                        # Add the new agent to our collection
+                        self.sub_agents[agent_id] = skills
+                        
+                        # Create simulated functions for missing tools
+                        for tool_name in missing_tools:
+                            async def simulated_tool_fn(ctx, **kwargs):
+                                logger.info(f"Executing simulated {tool_name} with sub-agent {agent_id}")
+                                try:
+                                    # Run sub-agent through Archon
+                                    tool_query = f"Execute {tool_name} with parameters: {json.dumps(kwargs)}"
+                                    agent_response = await self.services['archon'].run_agent(
+                                        thread_id=self.services['archon'].thread_id,
+                                        user_input=tool_query
+                                    )
+                                    
+                                    return {
+                                        "status": "success", 
+                                        "data": agent_response,
+                                        "tool": tool_name,
+                                        "agent_id": agent_id
+                                    }
+                                except Exception as e:
+                                    logger.error(f"Error executing simulated {tool_name}: {str(e)}")
+                                    return {
+                                        "status": "error",
+                                        "error": str(e),
+                                        "tool": tool_name
+                                    }
+                            
+                            # Add the function to available tools
+                            self.available_tools[tool_name] = simulated_tool_fn
+                            logger.info(f"Added simulated tool: {tool_name}")
+                    else:
+                        logger.error("Cannot create sub-agent: Archon service not available")
+                except Exception as e:
+                    logger.error(f"Failed to create sub-agent: {str(e)}")
+                    logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            # Create agent context for tool execution
+            from agent_tools import AgentContext
+            ctx = AgentContext(agent=self, deps=deps, log=logger)
+            
+            # Run the workflow with available tools
+            for tool in intent_tools:
+                if tool in self.available_tools:
+                    logger.info(f"Running tool: {tool}")
+                    tool_func = self.available_tools[tool]
+                    
+                    if tool == 'search_emails':
+                        emails = await tool_func(ctx, query=query, services=self.services, deps=deps)
+                        result['data']['emails'] = emails
+                        deps.state['processed_emails'] = emails
+                    
+                    elif tool == 'download_attachment':
+                        attachment_results = []
+                        
+                        # Try to find emails if not already in state
+                        if not deps.state.get('processed_emails'):
+                            logger.info("No emails in state, running search_emails first")
+                            if 'search_emails' in self.available_tools:
+                                emails = await self.available_tools['search_emails'](
+                                    ctx, query=query, services=self.services, deps=deps
+                                )
+                                deps.state['processed_emails'] = emails
+                            else:
+                                logger.warning("Cannot search emails: tool not available")
+                        
+                        if deps.state.get('processed_emails'):
+                            for email in deps.state['processed_emails']:
+                                if email.get('attachments'):
+                                    for attachment in email.get('attachments', []):
+                                        logger.info(f"Downloading attachment {attachment.get('filename', 'unknown')} from email {email.get('id', 'unknown')}")
+                                        try:
+                                            download_result = await tool_func(
+                                                ctx,
+                                                query=query,
+                                                services=self.services,
+                                                deps=deps
+                                            )
+                                            attachment_results.append(download_result)
+                                        except Exception as e:
+                                            logger.error(f"Error downloading attachment: {str(e)}")
+                                            attachment_results.append({
+                                                "status": "error",
+                                                "error": str(e),
+                                                "filename": attachment.get('filename', 'unknown')
+                                            })
+                        
+                        result['data']['attachments'] = attachment_results
+                        deps.state['downloaded_attachments'] = attachment_results
+                    
+                    elif tool == 'search_drive':
+                        try:
+                            drive_files = await tool_func(ctx, query=query, services=self.services, deps=deps)
+                            result['data']['drive_files'] = drive_files
+                            deps.state['drive_files'] = drive_files
+                        except Exception as e:
+                            logger.error(f"Error searching drive: {str(e)}")
+                            result['data']['drive_files'] = {"status": "error", "error": str(e)}
+                    
+                    elif tool == 'perform_rag':
+                        # Gather documents from various sources
+                        documents = []
+                        
+                        # From emails
+                        if 'processed_emails' in deps.state and deps.state['processed_emails']:
+                            for email in deps.state['processed_emails']:
+                                if email.get('body'):
+                                    documents.append(email.get('body'))
+                        
+                        # From attachments
+                        if 'attachments_content' in deps.state and deps.state['attachments_content']:
+                            for filename, content in deps.state['attachments_content'].items():
+                                if isinstance(content, str):
+                                    documents.append(content)
+                                elif isinstance(content, bytes):
+                                    # Try to decode bytes to string
+                                    try:
+                                        text_content = content.decode('utf-8', errors='ignore')
+                                        documents.append(f"ATTACHMENT: {filename}\n\n{text_content}")
+                                    except:
+                                        logger.warning(f"Could not decode attachment {filename} as text")
+                        
+                        # From drive files
+                        if 'drive_contents' in deps.state and deps.state['drive_contents']:
+                            for file_id, content in deps.state['drive_contents'].items():
+                                if content:
+                                    documents.append(content)
+                        
+                        # If we don't have any documents yet, try to get some
+                        if not documents and 'search_emails' in self.available_tools:
+                            logger.info("No documents for RAG, trying to search emails first")
+                            try:
+                                emails = await self.available_tools['search_emails'](
+                                    ctx, query=query, services=self.services, deps=deps
+                                )
+                                deps.state['processed_emails'] = emails
+                                
+                                # Add email bodies to documents
+                                for email in emails:
+                                    if email.get('body'):
+                                        documents.append(email.get('body'))
+                            except Exception as e:
+                                logger.error(f"Error searching emails for RAG: {str(e)}")
+                        
+                        if documents:
+                            try:
+                                rag_result = await tool_func(ctx, query=query, documents=documents)
+                                result['data']['rag_result'] = rag_result
+                                deps.state['rag_results'] = rag_result
+                            except Exception as e:
+                                logger.error(f"Error performing RAG: {str(e)}")
+                                result['data']['rag_result'] = {
+                                    'status': 'error',
+                                    'error': str(e),
+                                    'query': query
+                                }
+                        else:
+                            # No documents to process
+                            logger.warning("No documents available for RAG processing")
+                            result['data']['rag_result'] = {
+                                'status': 'no_documents',
+                                'message': 'No documents available for RAG processing'
+                            }
+                    else:
+                        # For any other tools
+                        try:
+                            tool_result = await tool_func(ctx, query=query, services=self.services, deps=deps)
+                            result['data'][tool] = tool_result
+                            deps.state[tool] = tool_result
+                        except Exception as e:
+                            logger.error(f"Error executing tool {tool}: {str(e)}")
+                            result['data'][tool] = {"status": "error", "error": str(e)}
+                
+                else:
+                    logger.warning(f"Tool {tool} not available and could not be created")
+                    result['data'][tool] = {"status": "unavailable", "message": f"Tool {tool} not available"}
+            
+            # Track progress
             try:
                 progress_record = {
-                    'query': query,
-                    'tools_used': tools,
-                    'timestamp': time.time(),
-                    'success': 'error' not in result
+                    'email_id': 'system',
+                    'file_hash': hashlib.md5(query.encode()).hexdigest(),
+                    'status': 'completed',
+                    'filename': f'query_{int(time.time())}'
                 }
-                
-                await track_progress(progress_record, self.services)
+                await agent_tools.track_progress(ctx, **progress_record)
             except Exception as e:
                 logger.error(f"Failed to track progress: {e}")
-                # Don't fail the whole operation if tracking fails
+            
+            # Add execution time
+            execution_time = time.time() - started_at
+            result['execution_time'] = f"{execution_time:.2f} seconds"
+            logger.info(f"Workflow executed in {execution_time:.2f} seconds")
             
             return result
         
         except Exception as e:
             logger.error(f"Workflow execution failed: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            # Ensure we have a valid response even in case of error
+            execution_time = time.time() - started_at
             return {
-                'error': f"Workflow execution failed: {str(e)}",
-                'query': query
+                'status': 'error',
+                'error': str(e),
+                'query': query,
+                'execution_time': f"{execution_time:.2f} seconds",
+                'timestamp': datetime.now().isoformat()
             }
 
 # Create the agent instance
