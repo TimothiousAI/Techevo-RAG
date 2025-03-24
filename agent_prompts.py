@@ -12,13 +12,20 @@ Your purpose is to help users process emails, search Drive, download attachments
 # Intent classification prompt
 INTENT_PROMPT = """
 Classify the intent of this query: {query}
-Return a list of tool names from the following options:
-- search_emails: Find emails matching certain criteria
-- download_attachment: Download an attachment from an email
-- perform_rag: Perform RAG operations on documents
-- search_drive: Search for files in Google Drive
+Extract the following information:
+1. Tools to use from: search_emails, download_attachment, perform_rag, search_drive
+2. Sender email address (if specified)
+3. Keywords for searching (subject or content)
+4. Whether attachments are mentioned (true/false)
 
-Example output format: ["search_emails", "download_attachment"]
+Return a JSON object with these fields:
+{{
+  "tools": ["tool1", "tool2"],
+  "sender": "email@example.com",  // null if not specified
+  "keywords": "relevant search terms",
+  "has_attachment": true/false
+}}
+
 Only include tools directly relevant to the query.
 """
 

@@ -46,6 +46,13 @@ This project uses Cursor MCP for:
   - Extended truncation limit to 500,000 characters (from 4,000) for larger documents
   - Test query "from:eman.abou_arab@bell.ca has:attachment" successfully retrieved emails and attachments
   - RAG processing with Gemini API provided higher quality summaries with better context handling
+- **March 27, 2025 Update**: Enhanced intent understanding to construct precise Gmail search queries
+  - Updated `predict_intent` to extract sender, keywords, and attachment flags from queries
+  - Improved Gmail query construction, automatically identifying search parameters
+  - Test query "find all emails with attachments from eman.abou_arab@bell.ca" automatically constructed "from:eman.abou_arab@bell.ca has:attachment" query (retrieved 5 emails with 3 attachments)
+  - Test query "process campaign emails" retrieved and analyzed campaign emails using enhanced keyword extraction
+  - Test query "analyze customer feedback trends" triggered dynamic agent creation through Archon MCP with specialized skills
+  - Added comprehensive logging to logfire for tracking search parameters and results
 
 ### Running Tests
 
@@ -64,6 +71,7 @@ To test the system manually:
    - "process campaign emails"
    - "analyze customer feedback trends"
    - "from:eman.abou_arab@bell.ca has:attachment" (retrieves and processes emails with attachments)
+   - "find all emails with attachments from eman.abou_arab@bell.ca" (tests intent extraction for Gmail query construction)
 4. Check the logs in the sidebar for detailed execution information
 
 ## Overview
@@ -76,9 +84,11 @@ Techevo-RAG automates processing emails, downloading attachments, searching Goog
 - **Google Drive Integration**: Search and process files
 - **RAG Processing**: Generate contextual responses using retrieved documents with Gemini API
 - **Optimized Chunking**: Document processing with 50-word overlap between chunks for better context preservation
+- **Intelligent Query Understanding**: Automatic extraction of search parameters (sender, keywords, attachment flags) to construct precise Gmail search queries
 - **Supabase Integration**: Track progress and store results
 - **MCP Integration**: Utilize Archon MCP for enhanced reasoning capabilities
 - **Dynamic Agent Creation**: Automatically create specialized sub-agents for complex tasks
+- **Comprehensive Logging**: Track all operations with detailed logging to logfire
 
 ## Requirements
 

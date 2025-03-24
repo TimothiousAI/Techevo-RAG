@@ -19,6 +19,7 @@ from datetime import datetime
 import copy
 from pathlib import Path
 import traceback
+import re
 
 # Google API imports
 from google.oauth2.credentials import Credentials
@@ -434,7 +435,7 @@ def create_faiss_index(dimension=768):
             logger.error(f"Fallback also failed: {fallback_e}")
             raise ValueError(f"Failed to create FAISS index: {e}, fallback error: {fallback_e}")
 
-async def predict_intent(query: str, archon_client: ArchonClient) -> List[str]:
+async def predict_intent(query: str, archon_client: ArchonClient) -> Dict[str, Any]:
     """
     Predict the intent of a user query using Archon MCP.
     
@@ -443,7 +444,7 @@ async def predict_intent(query: str, archon_client: ArchonClient) -> List[str]:
         archon_client: The Archon MCP client
         
     Returns:
-        List of tool names to execute
+        Dictionary with tools to execute and search parameters
     """
     try:
         # Save previous state before prediction
@@ -456,142 +457,94 @@ async def predict_intent(query: str, archon_client: ArchonClient) -> List[str]:
             model="openai:gpt-4o",
             prompt=prompt,
             temperature=0.2,
-            max_tokens=100
+            max_tokens=200
         )
         
         # Parse the response
         intent_text = response.get('response', '').strip()
         logger.info(f"Intent prediction: {intent_text}")
         
-        # Try to extract a list of tools
+        # Try to extract JSON data
         try:
-            # Check if it looks like a Python list representation
-            if intent_text.startswith('[') and intent_text.endswith(']'):
-                tools = json.loads(intent_text)
-                
-                # Verify response is valid
-                if not tools or not isinstance(tools, list):
-                    error_msg = "Invalid tools list from Archon, retrying with context"
-                    logger.error(error_msg)
-                    logfire.error(error_msg)
-                    
-                    # Retry with more context
-                    return await retry_predict_intent(query, archon_client)
-                
-                # Make sure perform_rag is included for process/summarize queries
-                if ('process' in query.lower() or 'summarize' in query.lower() or 'analyze' in query.lower()) and 'perform_rag' not in tools:
-                    tools.append('perform_rag')
-                    logger.info("Added perform_rag to tools list for processing/summarization query")
-                
-                return tools
-            else:
-                # Handle plaintext responses by looking for tool names
-                valid_tools = ['search_emails', 'download_attachment', 'perform_rag', 'search_drive']
-                found_tools = []
-                
-                for tool in valid_tools:
-                    if tool.lower() in intent_text.lower():
-                        found_tools.append(tool)
-                
-                # Add perform_rag for processing/summarization queries
-                if ('process' in query.lower() or 'summarize' in query.lower() or 'analyze' in query.lower()) and 'perform_rag' not in found_tools:
-                    found_tools.append('perform_rag')
-                    logger.info("Added perform_rag to tools list for processing/summarization query")
-                
-                if not found_tools:
-                    logger.warning("No tools found in plaintext response, retrying")
-                    logfire.warning("No tools found in plaintext response, retrying")
-                    return await retry_predict_intent(query, archon_client)
-                    
-                return found_tools
-        except json.JSONDecodeError:
-            # Handle plain text responses
-            found_tools = []
+            intent_data = json.loads(intent_text)
             
-            if 'search_emails' in intent_text.lower():
-                found_tools.append('search_emails')
-            if 'download' in intent_text.lower() or 'attachment' in intent_text.lower():
-                found_tools.append('download_attachment')
-            if 'rag' in intent_text.lower():
-                found_tools.append('perform_rag')
-            if 'drive' in intent_text.lower():
-                found_tools.append('search_drive')
+            # Ensure we have required fields with defaults
+            if not isinstance(intent_data, dict):
+                logger.warning("Response is not a dictionary, using fallback")
+                return fallback_intent(query)
+                
+            if 'tools' not in intent_data or not isinstance(intent_data['tools'], list):
+                intent_data['tools'] = ['search_emails', 'perform_rag']
+                
+            if 'sender' not in intent_data:
+                intent_data['sender'] = None
+                
+            if 'keywords' not in intent_data:
+                intent_data['keywords'] = query
+                
+            if 'has_attachment' not in intent_data:
+                intent_data['has_attachment'] = False
             
-            # Add perform_rag for processing/summarization queries
-            if ('process' in query.lower() or 'summarize' in query.lower() or 'analyze' in query.lower()) and 'perform_rag' not in found_tools:
-                found_tools.append('perform_rag')
+            # Make sure perform_rag is included for process/summarize queries
+            if ('process' in query.lower() or 'summarize' in query.lower() or 'analyze' in query.lower()) and 'perform_rag' not in intent_data['tools']:
+                intent_data['tools'].append('perform_rag')
                 logger.info("Added perform_rag to tools list for processing/summarization query")
             
-            return found_tools if found_tools else ['search_emails', 'perform_rag']
+            return intent_data
+            
+        except json.JSONDecodeError:
+            logger.warning(f"Could not parse JSON response: {intent_text}")
+            # Fall back to keyword extraction
+            return fallback_intent(query)
     
     except Exception as e:
         error_msg = f"Error predicting intent: {str(e)}"
         logger.error(error_msg)
         logfire.error(error_msg)
         
-        # Fall back to a default set of tools
-        return ['search_emails', 'perform_rag']
+        # Fall back to a default set of tools and parameters
+        return fallback_intent(query)
 
-async def retry_predict_intent(query: str, archon_client: ArchonClient) -> List[str]:
+def fallback_intent(query: str) -> Dict[str, Any]:
     """
-    Retry intent prediction with more context if the first attempt failed.
+    Fallback intent prediction using keyword matching.
     
     Args:
         query: The user query
-        archon_client: The Archon MCP client
         
     Returns:
-        List of tool names to execute
+        Dictionary with tools to execute and search parameters
     """
-    try:
-        # More detailed prompt with examples
-        detailed_prompt = f"""
-        Analyze this query: "{query}"
+    # Extract tools using keywords
+    tools = []
+    if 'email' in query.lower() or 'mail' in query.lower():
+        tools.append('search_emails')
+    if 'attachment' in query.lower() or 'download' in query.lower() or 'file' in query.lower():
+        tools.append('download_attachment')
+    if 'drive' in query.lower() or 'document' in query.lower():
+        tools.append('search_drive')
+    if 'process' in query.lower() or 'analyze' in query.lower() or 'summarize' in query.lower():
+        tools.append('perform_rag')
+    
+    # Always include search_emails and perform_rag as fallback
+    if not tools or len(tools) == 0:
+        tools = ['search_emails', 'perform_rag']
         
-        Determine which tools to use from:
-        - search_emails: Search for emails matching criteria
-        - download_attachment: Download attachments from emails
-        - perform_rag: Perform retrieval augmented generation
-        - search_drive: Search files in Google Drive
-        
-        Examples:
-        - "find emails about marketing" → ["search_emails"]
-        - "download attachments from project emails" → ["search_emails", "download_attachment"]
-        - "process campaign data" → ["search_emails", "download_attachment", "perform_rag"]
-        
-        Return only a JSON array of tool names, like: ["tool1", "tool2"]
-        """
-        
-        response = await archon_client.generate(
-            model="openai:gpt-4o",
-            prompt=detailed_prompt,
-            temperature=0.1,
-            max_tokens=100
-        )
-        
-        intent_text = response.get('response', '').strip()
-        
-        # Try to parse as JSON
-        try:
-            if '[' in intent_text and ']' in intent_text:
-                # Extract the array part
-                start = intent_text.find('[')
-                end = intent_text.rfind(']') + 1
-                array_text = intent_text[start:end]
-                
-                tools = json.loads(array_text)
-                if tools and isinstance(tools, list):
-                    return tools
-            
-            # If parsing fails, use default tools
-            return ['search_emails', 'perform_rag']
-        except:
-            # Default fallback
-            return ['search_emails', 'perform_rag']
-    except Exception as e:
-        logger.error(f"Error in retry_predict_intent: {str(e)}")
-        logfire.error(f"Error in retry_predict_intent: {str(e)}")
-        return ['search_emails', 'perform_rag']
+    # Try to extract sender from email pattern
+    sender_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    sender_match = re.search(sender_pattern, query)
+    sender = sender_match.group(0) if sender_match else None
+    
+    # Check for attachment mention
+    has_attachment = 'attachment' in query.lower()
+    
+    # Return structured intent data
+    return {
+        'tools': tools,
+        'sender': sender,
+        'keywords': query,
+        'has_attachment': has_attachment
+    }
 
 class TechevoRagAgent:
     """Main agent class for Techevo RAG."""
@@ -659,36 +612,50 @@ class TechevoRagAgent:
                     logger.error(traceback.format_exc())
             
             logger.info(f"Predicting intent for query: {query}")
-            intent_tools = []
             
+            # Get intent with enhanced search parameters
             if 'archon' in self.services:
-                intent_tools = await predict_intent(query, self.services['archon'])
-                logger.info(f"Predicted tools via Archon: {intent_tools}")
+                intent_data = await predict_intent(query, self.services['archon'])
+                intent_tools = intent_data.get('tools', ['search_emails', 'perform_rag'])
+                sender = intent_data.get('sender')
+                keywords = intent_data.get('keywords', query)
+                has_attachment = intent_data.get('has_attachment', False)
+                logger.info(f"Predicted intent: tools={intent_tools}, sender={sender}, keywords={keywords}, has_attachment={has_attachment}")
             else:
                 # Fallback without Archon
                 logger.warning("Archon service not available, using default intent prediction")
+                intent_data = fallback_intent(query)
+                intent_tools = intent_data.get('tools', ['search_emails', 'perform_rag'])
+                sender = intent_data.get('sender')
+                keywords = intent_data.get('keywords', query)
+                has_attachment = intent_data.get('has_attachment', False)
+                logger.info(f"Fallback intent: tools={intent_tools}, sender={sender}, keywords={keywords}, has_attachment={has_attachment}")
+            
+            # Construct Gmail search query
+            search_query = []
+            if sender:
+                search_query.append(f"from:{sender}")
+            if keywords and keywords != query:  # Only add if keywords are specific and not the full query
+                # Extract meaningful keywords if possible
+                search_query.append(keywords)
+            if has_attachment:
+                search_query.append("has:attachment")
                 
-                # Simple keyword-based tool selection
-                intent_tools = []
-                if 'email' in query.lower() or 'mail' in query.lower():
-                    intent_tools.append('search_emails')
-                if 'attachment' in query.lower() or 'download' in query.lower() or 'file' in query.lower():
-                    intent_tools.append('download_attachment')
-                if 'drive' in query.lower() or 'document' in query.lower():
-                    intent_tools.append('search_drive')
-                if 'process' in query.lower() or 'analyze' in query.lower() or 'summarize' in query.lower():
-                    intent_tools.append('perform_rag')
+            # Add default time range if no specific criteria
+            if not search_query:
+                search_query.append(query)  # Use original query if no specific params extracted
                 
-                # Always include search_emails and perform_rag as fallback
-                if not intent_tools or len(intent_tools) == 0:
-                    intent_tools = ['search_emails', 'perform_rag']
-                
-                logger.info(f"Predicted tools via fallback: {intent_tools}")
+            gmail_query = " ".join(search_query)
+            logger.info(f"Constructed Gmail search query: {gmail_query}")
+            
+            # Store the constructed query in the state
+            deps.state['gmail_query'] = gmail_query
             
             result = {
                 'status': 'success',
                 'data': {},
                 'query': query,
+                'gmail_query': gmail_query,
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -768,12 +735,30 @@ class TechevoRagAgent:
                     
                     if tool == 'search_emails':
                         try:
-                            # Pass parameters in the correct order as defined in the function signature
-                            emails = await tool_func(query, self.services, deps)
+                            # Use the constructed Gmail query instead of the original query
+                            logger.info(f"Searching emails with query: {gmail_query}")
+                            emails = await tool_func(gmail_query, self.services, deps)
                             result['data']['emails'] = emails
                             deps.state['processed_emails'] = emails
+                            
+                            # Log the result details
+                            email_count = len(emails) if emails else 0
+                            attachment_count = sum(len(email.get('attachments', [])) for email in emails) if emails else 0
+                            logfire.info(f"Email search results", {
+                                'query': query,
+                                'gmail_query': gmail_query,
+                                'email_count': email_count,
+                                'attachment_count': attachment_count,
+                                'has_emails': email_count > 0
+                            })
                         except Exception as e:
                             logger.error(f"Error searching emails: {str(e)}")
+                            logfire.error(f"Email search error", {
+                                'query': query, 
+                                'gmail_query': gmail_query,
+                                'error': str(e),
+                                'traceback': traceback.format_exc()
+                            })
                             result['data']['emails'] = {"status": "error", "error": str(e)}
                     
                     elif tool == 'download_attachment':
@@ -784,7 +769,8 @@ class TechevoRagAgent:
                             logger.info("No emails in state, running search_emails first")
                             if 'search_emails' in self.available_tools:
                                 try:
-                                    emails = await self.available_tools['search_emails'](query, self.services, deps)
+                                    # Use the constructed Gmail query
+                                    emails = await self.available_tools['search_emails'](gmail_query, self.services, deps)
                                     deps.state['processed_emails'] = emails
                                 except Exception as e:
                                     logger.error(f"Error searching emails before download: {str(e)}")
@@ -797,92 +783,107 @@ class TechevoRagAgent:
                                     for attachment in email.get('attachments', []):
                                         logger.info(f"Downloading attachment {attachment.get('filename', 'unknown')} from email {email.get('id', 'unknown')}")
                                         try:
-                                            # Pass parameters in the correct order
+                                            # Use the existing download_attachment logic
                                             download_result = await tool_func(query, self.services, deps)
                                             attachment_results.append(download_result)
                                         except Exception as e:
                                             logger.error(f"Error downloading attachment: {str(e)}")
                                             attachment_results.append({
-                                                "status": "error",
-                                                "error": str(e),
-                                                "filename": attachment.get('filename', 'unknown')
+                                                "status": "error", 
+                                                "error": str(e), 
+                                                "email_id": email.get('id', 'unknown'),
+                                                "attachment": attachment.get('filename', 'unknown')
                                             })
-                        
-                        result['data']['attachments'] = attachment_results
-                        deps.state['downloaded_attachments'] = attachment_results
+                            
+                            result['data']['attachments'] = attachment_results
+                            deps.state['downloaded_attachments'] = attachment_results
+                            
+                            # Log attachment download results
+                            logfire.info("Attachment download results", {
+                                'query': query,
+                                'gmail_query': gmail_query,
+                                'attachment_count': len(attachment_results),
+                                'success_count': sum(1 for a in attachment_results if a.get('status') != 'error'),
+                                'error_count': sum(1 for a in attachment_results if a.get('status') == 'error')
+                            })
+                        else:
+                            logger.warning("No emails with attachments found")
+                            result['data']['attachments'] = []
                     
                     elif tool == 'search_drive':
                         try:
-                            # Pass parameters in the correct order
                             drive_files = await tool_func(query, self.services, deps)
                             result['data']['drive_files'] = drive_files
                             deps.state['drive_files'] = drive_files
+                            
+                            # Log drive search results
+                            logfire.info("Drive search results", {
+                                'query': query,
+                                'file_count': len(drive_files) if drive_files else 0,
+                                'has_files': len(drive_files) > 0 if drive_files else False
+                            })
                         except Exception as e:
-                            logger.error(f"Error searching drive: {str(e)}")
+                            logger.error(f"Error searching Drive: {str(e)}")
                             result['data']['drive_files'] = {"status": "error", "error": str(e)}
                     
                     elif tool == 'perform_rag':
-                        # Gather documents from various sources
                         documents = []
                         
-                        # From emails
+                        # Collect documents from emails
                         if 'processed_emails' in deps.state and deps.state['processed_emails']:
                             for email in deps.state['processed_emails']:
                                 if email.get('body'):
                                     documents.append(email.get('body'))
                         
-                        # From attachments
+                        # Collect documents from attachments
                         if 'attachments_content' in deps.state and deps.state['attachments_content']:
                             for filename, content in deps.state['attachments_content'].items():
-                                if isinstance(content, str):
-                                    documents.append(content)
-                                elif isinstance(content, bytes):
-                                    # Try to decode bytes to string
+                                if isinstance(content, bytes):
                                     try:
-                                        text_content = content.decode('utf-8', errors='ignore')
-                                        documents.append(f"ATTACHMENT: {filename}\n\n{text_content}")
+                                        text = content.decode('utf-8', errors='ignore')
+                                        documents.append(text)
                                     except:
-                                        logger.warning(f"Could not decode attachment {filename} as text")
+                                        logger.warning(f"Could not decode attachment content for {filename}")
+                                elif isinstance(content, str):
+                                    documents.append(content)
                         
-                        # From drive files
+                        # Collect documents from Drive
                         if 'drive_contents' in deps.state and deps.state['drive_contents']:
                             for file_id, content in deps.state['drive_contents'].items():
                                 if content:
                                     documents.append(content)
                         
-                        # If we don't have any documents yet, try to get some
-                        if not documents and 'search_emails' in self.available_tools:
-                            logger.info("No documents for RAG, trying to search emails first")
-                            try:
-                                emails = await self.available_tools['search_emails'](query, self.services, deps)
-                                deps.state['processed_emails'] = emails
-                                
-                                # Add email bodies to documents
-                                for email in emails:
-                                    if email.get('body'):
-                                        documents.append(email.get('body'))
-                            except Exception as e:
-                                logger.error(f"Error searching emails for RAG: {str(e)}")
-                        
                         if documents:
                             try:
-                                # Call perform_rag with ctx as first argument, then query and documents
-                                rag_result = await tool_func(ctx, query=query, documents=documents)
+                                logger.info(f"Performing RAG on {len(documents)} documents")
+                                rag_result = await tool_func(ctx, query, documents)
                                 result['data']['rag_result'] = rag_result
                                 deps.state['rag_results'] = rag_result
+                                
+                                # Log RAG results
+                                logfire.info("RAG results", {
+                                    'query': query,
+                                    'document_count': len(documents),
+                                    'chunks_used': len(rag_result.get('chunks_used', [])),
+                                    'status': rag_result.get('status'),
+                                    'model': rag_result.get('model', 'gemini-2.0-flash'),
+                                    'response_length': len(rag_result.get('response', ''))
+                                })
                             except Exception as e:
                                 logger.error(f"Error performing RAG: {str(e)}")
                                 result['data']['rag_result'] = {
-                                    'status': 'error',
-                                    'error': str(e),
-                                    'query': query
+                                    'query': query,
+                                    'response': f'Error performing RAG: {str(e)}',
+                                    'chunks_used': [],
+                                    'status': 'error'
                                 }
                         else:
-                            # No documents to process
-                            logger.warning("No documents available for RAG processing")
+                            logger.warning("No documents available for RAG processing.")
                             result['data']['rag_result'] = {
-                                'status': 'no_documents',
-                                'message': 'No documents available for RAG processing'
+                                'query': query,
+                                'response': 'No documents available to process.',
+                                'chunks_used': [],
+                                'status': 'no_data'
                             }
                     else:
                         # For any other tools
@@ -911,25 +912,25 @@ class TechevoRagAgent:
             except Exception as e:
                 logger.error(f"Failed to track progress: {e}")
             
-            # Add execution time
-            execution_time = time.time() - started_at
-            result['execution_time'] = f"{execution_time:.2f} seconds"
-            logger.info(f"Workflow executed in {execution_time:.2f} seconds")
+            # Calculate runtime
+            runtime = time.time() - started_at
+            result['runtime'] = runtime
+            logger.info(f"Workflow completed in {runtime:.2f} seconds")
             
             return result
-        
         except Exception as e:
-            logger.error(f"Workflow execution failed: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            # Ensure we have a valid response even in case of error
-            execution_time = time.time() - started_at
+            logger.error(f"Error running workflow: {str(e)}")
+            logger.error(traceback.format_exc())
+            logfire.error("Workflow error", {
+                'query': query,
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            })
             return {
                 'status': 'error',
                 'error': str(e),
                 'query': query,
-                'execution_time': f"{execution_time:.2f} seconds",
-                'timestamp': datetime.now().isoformat()
+                'runtime': time.time() - started_at
             }
 
 # Create the agent instance
