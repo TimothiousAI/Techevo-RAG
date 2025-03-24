@@ -36,12 +36,28 @@ This project uses Cursor MCP for:
 - Test query "process campaign emails" identified 3 campaign emails with 2 attachments
 - Supabase integration test: 3 entries saved to processed_items table, 1 to rag_results
 - Error handling verified: OpenAI fallback triggered successfully when MCP was unavailable
+- **March 25, 2025 Update**: Fixed search_emails function call error, verified Gmail API setup
+  - Test query "find the last email from Bell about updated standards" successfully retrieved matching emails
+  - Test query "process campaign emails" retrieved emails and performed RAG analysis
+  - Test query "analyze customer feedback trends" triggered dynamic agent creation via Archon MCP
 
 ### Running Tests
 
 ```bash
 pytest -v
 ```
+
+### Manual Testing
+
+To test the system manually:
+
+1. Start the Streamlit app: `streamlit run streamlit_app.py --server.port 8502`
+2. Access the UI at http://localhost:8502
+3. Try example queries:
+   - "find the last email from Bell about updated standards"
+   - "process campaign emails"
+   - "analyze customer feedback trends"
+4. Check the logs in the sidebar for detailed execution information
 
 ## Overview
 

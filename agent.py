@@ -87,8 +87,12 @@ def validate_env_vars() -> None:
         raise ValueError(error_msg)
 
 # Google API scopes
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly',
-          'https://www.googleapis.com/auth/drive']
+SCOPES = [
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/drive.readonly'
+]
 
 # For MCP-based communication with Archon
 class ArchonClient:
@@ -322,35 +326,81 @@ async def setup_google_services() -> Tuple[Any, Any]:
     credentials_path = os.getenv('CREDENTIALS_JSON_PATH')
     token_path = 'token.json'
     
+    # Validate credentials path
+    if not credentials_path or not os.path.exists(credentials_path):
+        error_msg = f"Credentials file not found at {credentials_path}. Please set CREDENTIALS_JSON_PATH in .env to a valid credentials.json file."
+        logger.error(error_msg)
+        logfire.error(error_msg)
+        raise ValueError(error_msg)
+    
     # Check if token already exists
     if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_info(
-            json.load(open(token_path)), SCOPES)
+        try:
+            with open(token_path, 'r') as token_file:
+                token_data = json.load(token_file)
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+            logger.info("Loaded credentials from token.json")
+        except Exception as e:
+            logger.error(f"Error loading token.json: {str(e)}")
+            logger.error(traceback.format_exc())
+            creds = None
     
     # If no valid credentials available, authenticate
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not credentials_path or not os.path.exists(credentials_path):
-                error_msg = f"Credentials file not found at {credentials_path}. Please set CREDENTIALS_JSON_PATH in .env to a valid credentials.json file."
-                logger.error(error_msg)
-                logfire.error(error_msg)
-                raise ValueError(error_msg)
-                
-            flow = InstalledAppFlow.from_client_secrets_file(
-                credentials_path, SCOPES)
-            creds = flow.run_local_server(port=0)
+            try:
+                logger.info("Refreshing expired credentials")
+                creds.refresh(Request())
+                logger.info("Credentials refreshed successfully")
+            except Exception as e:
+                logger.error(f"Error refreshing credentials: {str(e)}")
+                logger.error(traceback.format_exc())
+                creds = None
         
-        # Save the credentials
-        with open(token_path, 'w') as token:
-            token.write(creds.to_json())
+        if not creds:
+            try:
+                logger.info(f"Starting OAuth flow with credentials from {credentials_path}")
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    credentials_path, SCOPES)
+                creds = flow.run_local_server(port=0)
+                logger.info("OAuth flow completed successfully")
+                
+                # Save the credentials
+                with open(token_path, 'w') as token:
+                    token.write(creds.to_json())
+                logger.info(f"Credentials saved to {token_path}")
+            except Exception as e:
+                logger.error(f"Error during OAuth flow: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise ValueError(f"Failed to authenticate with Google: {str(e)}")
+    
+    # Verify we have valid credentials
+    if not creds:
+        error_msg = "Failed to authenticate with Google services."
+        logger.error(error_msg)
+        logfire.error(error_msg)
+        raise ValueError(error_msg)
     
     # Build services
-    gmail_service = build('gmail', 'v1', credentials=creds)
-    drive_service = build('drive', 'v3', credentials=creds)
-    
-    return gmail_service, drive_service
+    try:
+        gmail_service = build('gmail', 'v1', credentials=creds)
+        logger.info("Gmail service created successfully")
+        
+        drive_service = build('drive', 'v3', credentials=creds)
+        logger.info("Drive service created successfully")
+        
+        # Verify Gmail connection with a simple test
+        try:
+            profile = gmail_service.users().getProfile(userId='me').execute()
+            logger.info(f"Connected to Gmail as: {profile.get('emailAddress', 'unknown')}")
+        except Exception as e:
+            logger.warning(f"Gmail connection test failed: {str(e)}")
+        
+        return gmail_service, drive_service
+    except Exception as e:
+        logger.error(f"Error building Google services: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise ValueError(f"Failed to build Google services: {str(e)}")
 
 def create_faiss_index(dimension=768):
     """Create an empty FAISS index with the specified dimension.
@@ -591,7 +641,7 @@ class TechevoRagAgent:
             # Initialize state
             deps.state = {
                 'query': query,
-                'processed_emails': [],
+                'processed_emails': deps.state.get('processed_emails', []),
                 'downloaded_attachments': [],
                 'rag_results': [],
                 'start_time': started_at
@@ -717,9 +767,14 @@ class TechevoRagAgent:
                     tool_func = self.available_tools[tool]
                     
                     if tool == 'search_emails':
-                        emails = await tool_func(ctx, query=query, services=self.services, deps=deps)
-                        result['data']['emails'] = emails
-                        deps.state['processed_emails'] = emails
+                        try:
+                            # Pass parameters in the correct order as defined in the function signature
+                            emails = await tool_func(query, self.services, deps)
+                            result['data']['emails'] = emails
+                            deps.state['processed_emails'] = emails
+                        except Exception as e:
+                            logger.error(f"Error searching emails: {str(e)}")
+                            result['data']['emails'] = {"status": "error", "error": str(e)}
                     
                     elif tool == 'download_attachment':
                         attachment_results = []
@@ -728,10 +783,11 @@ class TechevoRagAgent:
                         if not deps.state.get('processed_emails'):
                             logger.info("No emails in state, running search_emails first")
                             if 'search_emails' in self.available_tools:
-                                emails = await self.available_tools['search_emails'](
-                                    ctx, query=query, services=self.services, deps=deps
-                                )
-                                deps.state['processed_emails'] = emails
+                                try:
+                                    emails = await self.available_tools['search_emails'](query, self.services, deps)
+                                    deps.state['processed_emails'] = emails
+                                except Exception as e:
+                                    logger.error(f"Error searching emails before download: {str(e)}")
                             else:
                                 logger.warning("Cannot search emails: tool not available")
                         
@@ -741,12 +797,8 @@ class TechevoRagAgent:
                                     for attachment in email.get('attachments', []):
                                         logger.info(f"Downloading attachment {attachment.get('filename', 'unknown')} from email {email.get('id', 'unknown')}")
                                         try:
-                                            download_result = await tool_func(
-                                                ctx,
-                                                query=query,
-                                                services=self.services,
-                                                deps=deps
-                                            )
+                                            # Pass parameters in the correct order
+                                            download_result = await tool_func(query, self.services, deps)
                                             attachment_results.append(download_result)
                                         except Exception as e:
                                             logger.error(f"Error downloading attachment: {str(e)}")
@@ -761,7 +813,8 @@ class TechevoRagAgent:
                     
                     elif tool == 'search_drive':
                         try:
-                            drive_files = await tool_func(ctx, query=query, services=self.services, deps=deps)
+                            # Pass parameters in the correct order
+                            drive_files = await tool_func(query, self.services, deps)
                             result['data']['drive_files'] = drive_files
                             deps.state['drive_files'] = drive_files
                         except Exception as e:
@@ -801,9 +854,7 @@ class TechevoRagAgent:
                         if not documents and 'search_emails' in self.available_tools:
                             logger.info("No documents for RAG, trying to search emails first")
                             try:
-                                emails = await self.available_tools['search_emails'](
-                                    ctx, query=query, services=self.services, deps=deps
-                                )
+                                emails = await self.available_tools['search_emails'](query, self.services, deps)
                                 deps.state['processed_emails'] = emails
                                 
                                 # Add email bodies to documents
@@ -815,6 +866,7 @@ class TechevoRagAgent:
                         
                         if documents:
                             try:
+                                # Call perform_rag with ctx as first argument, then query and documents
                                 rag_result = await tool_func(ctx, query=query, documents=documents)
                                 result['data']['rag_result'] = rag_result
                                 deps.state['rag_results'] = rag_result
@@ -835,7 +887,8 @@ class TechevoRagAgent:
                     else:
                         # For any other tools
                         try:
-                            tool_result = await tool_func(ctx, query=query, services=self.services, deps=deps)
+                            # Generic tool call with properly ordered arguments
+                            tool_result = await tool_func(query, self.services, deps)
                             result['data'][tool] = tool_result
                             deps.state[tool] = tool_result
                         except Exception as e:
