@@ -131,7 +131,11 @@ async def initialize_services():
 # Sync wrapper for the async initialization
 def sync_initialize_services():
     """Synchronous wrapper for initialization."""
-    return asyncio.run(initialize_services())
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        return loop.run_until_complete(initialize_services())
+    else:
+        return asyncio.run(initialize_services())
 
 # Async function to run the agent
 async def run_agent_async(query: str, deps: EnhancedDeps):
@@ -174,7 +178,11 @@ async def run_agent_async(query: str, deps: EnhancedDeps):
 # Sync wrapper for running the agent
 def sync_run_agent(query: str, deps: EnhancedDeps):
     """Synchronous wrapper for running the agent."""
-    return asyncio.run(run_agent_async(query, deps))
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        return loop.run_until_complete(run_agent_async(query, deps))
+    else:
+        return asyncio.run(run_agent_async(query, deps))
 
 # Add a log message
 def add_log(message: str):

@@ -744,7 +744,7 @@ class TechevoRagAgent:
                             # Log the result details
                             email_count = len(emails) if emails else 0
                             attachment_count = sum(len(email.get('attachments', [])) for email in emails) if emails else 0
-                            logfire.info(f"Email search results", {
+                            logfire.info("Email search results", {
                                 'query': query,
                                 'gmail_query': gmail_query,
                                 'email_count': email_count,
@@ -753,7 +753,7 @@ class TechevoRagAgent:
                             })
                         except Exception as e:
                             logger.error(f"Error searching emails: {str(e)}")
-                            logfire.error(f"Email search error", {
+                            logfire.error("Email search error", {
                                 'query': query, 
                                 'gmail_query': gmail_query,
                                 'error': str(e),
