@@ -40,6 +40,12 @@ This project uses Cursor MCP for:
   - Test query "find the last email from Bell about updated standards" successfully retrieved matching emails
   - Test query "process campaign emails" retrieved emails and performed RAG analysis
   - Test query "analyze customer feedback trends" triggered dynamic agent creation via Archon MCP
+- **March 26, 2025 Update**: Integrated Gemini API (gemini-2.0-flash) for RAG processing
+  - Improved chunking with 50-word overlap for better context preservation
+  - Increased chunk limit from 5 to 10 for more comprehensive context
+  - Extended truncation limit to 500,000 characters (from 4,000) for larger documents
+  - Test query "from:eman.abou_arab@bell.ca has:attachment" successfully retrieved emails and attachments
+  - RAG processing with Gemini API provided higher quality summaries with better context handling
 
 ### Running Tests
 
@@ -57,19 +63,22 @@ To test the system manually:
    - "find the last email from Bell about updated standards"
    - "process campaign emails"
    - "analyze customer feedback trends"
+   - "from:eman.abou_arab@bell.ca has:attachment" (retrieves and processes emails with attachments)
 4. Check the logs in the sidebar for detailed execution information
 
 ## Overview
 
-Techevo-RAG automates processing emails, downloading attachments, searching Google Drive, and performing RAG (Retrieval Augmented Generation) operations to provide contextually relevant responses. Built with Pydantic AI, it uses embeddings from the `all-MiniLM-L6-v2` model (768 dimensions) and FAISS for vector storage.
+Techevo-RAG automates processing emails, downloading attachments, searching Google Drive, and performing RAG (Retrieval Augmented Generation) operations to provide contextually relevant responses. Built with Pydantic AI, it uses embeddings from the `all-MiniLM-L6-v2` model (768 dimensions) and FAISS for vector storage. RAG processing is powered by Google's Gemini API (gemini-2.0-flash) with OpenAI fallback for enhanced response quality and reliability.
 
 ## Key Features
 
 - **Gmail Integration**: Search emails and download attachments
 - **Google Drive Integration**: Search and process files
-- **RAG Processing**: Generate contextual responses using retrieved documents
+- **RAG Processing**: Generate contextual responses using retrieved documents with Gemini API
+- **Optimized Chunking**: Document processing with 50-word overlap between chunks for better context preservation
 - **Supabase Integration**: Track progress and store results
 - **MCP Integration**: Utilize Archon MCP for enhanced reasoning capabilities
+- **Dynamic Agent Creation**: Automatically create specialized sub-agents for complex tasks
 
 ## Requirements
 

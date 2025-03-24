@@ -12,13 +12,14 @@ from datetime import datetime
 from pathlib import Path
 import asyncio
 import traceback
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Optional, Union, Tuple
 import logfire
 import io
 import base64
 from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
+import httpx
 
 from agent_prompts import (
     RAG_PROMPT, 
@@ -473,9 +474,55 @@ async def search_drive(query: str, services: Dict, deps) -> List[Dict]:
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
+async def chunk_and_embed_document(document: str, model: SentenceTransformer, chunk_size: int = 500, overlap: int = 50) -> List[Tuple[str, np.ndarray]]:
+    """
+    Chunk a document into smaller pieces with overlap and generate embeddings.
+    
+    Args:
+        document: The text document to chunk
+        model: The SentenceTransformer model to use for embeddings
+        chunk_size: The size of each chunk in words
+        overlap: The number of words to overlap between chunks
+        
+    Returns:
+        List of (chunk, embedding) tuples
+    """
+    try:
+        # Split into words for more precise chunking with overlap
+        words = document.split()
+        chunks = []
+        
+        # Create chunks with overlap
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk_words = words[i:i + chunk_size]
+            if not chunk_words:
+                break
+            chunk = ' '.join(chunk_words)
+            chunks.append(chunk)
+            
+        # Generate embeddings for all chunks
+        if chunks:
+            try:
+                embeddings = model.encode(chunks)
+                return list(zip(chunks, embeddings))
+            except Exception as e:
+                # If batch is too large, process in smaller batches
+                result = []
+                batch_size = 10
+                for i in range(0, len(chunks), batch_size):
+                    batch = chunks[i:i+batch_size]
+                    batch_embeddings = model.encode(batch)
+                    result.extend([(batch[j], batch_embeddings[j]) for j in range(len(batch))])
+                return result
+        return []
+    except Exception as e:
+        logger.error(f"Error in chunk_and_embed_document: {str(e)}")
+        logger.error(traceback.format_exc())
+        return []
+
 async def perform_rag(ctx, query: str, documents: List[str]) -> Dict[str, Any]:
     """
-    Perform RAG operation on documents.
+    Perform RAG operation on documents using Gemini API.
     
     Args:
         ctx: Agent context containing deps and logger
@@ -510,51 +557,18 @@ async def perform_rag(ctx, query: str, documents: List[str]) -> Dict[str, Any]:
         
         all_chunks_with_embeddings = []
         
-        # Chunk and embed documents
+        # Chunk and embed documents with improved chunking
         for doc_idx, document in enumerate(documents):
             try:
                 # Skip empty or invalid documents
                 if not document or not isinstance(document, str):
                     ctx.log.warning(f"Skipping invalid document at index {doc_idx}")
                     continue
-                    
-                # Helper function to chunk a document and generate embeddings
-                async def chunk_and_embed_document(doc, model):
-                    chunks = []
-                    # Simple chunking by splitting on paragraphs with reasonable size
-                    paragraphs = doc.split('\n\n')
-                    for i, para in enumerate(paragraphs):
-                        if para.strip():
-                            # Further chunk long paragraphs
-                            if len(para) > 1000:
-                                sentences = para.split('. ')
-                                for j in range(0, len(sentences), 5):
-                                    chunk = '. '.join(sentences[j:j+5])
-                                    if chunk.strip():
-                                        chunks.append(chunk)
-                            else:
-                                chunks.append(para)
-                    
-                    ctx.log.info(f"Created {len(chunks)} chunks from document")
-                    
-                    # Generate embeddings for chunks
-                    try:
-                        embeddings = model.encode(chunks)
-                        return [(chunks[i], embeddings[i]) for i in range(len(chunks))]
-                    except Exception as e:
-                        ctx.log.error(f"Error encoding chunks: {str(e)}")
-                        # Try with smaller batches if we hit out of memory
-                        result = []
-                        batch_size = 10
-                        for i in range(0, len(chunks), batch_size):
-                            batch = chunks[i:i+batch_size]
-                            batch_embeddings = model.encode(batch)
-                            result.extend([(batch[j], batch_embeddings[j]) for j in range(len(batch))])
-                        return result
                 
+                # Use the improved chunking function with overlap
                 chunk_embeddings = await chunk_and_embed_document(document, model)
                 all_chunks_with_embeddings.extend(chunk_embeddings)
-                ctx.log.info(f"Processed document {doc_idx+1}/{len(documents)}")
+                ctx.log.info(f"Processed document {doc_idx+1}/{len(documents)} - created {len(chunk_embeddings)} chunks")
                 
             except Exception as e:
                 ctx.log.error(f"Error processing document {doc_idx}: {str(e)}")
@@ -587,7 +601,7 @@ async def perform_rag(ctx, query: str, documents: List[str]) -> Dict[str, Any]:
         # Query the index
         try:
             query_embedding = model.encode([query])[0]
-            k = min(5, len(chunks))  # Number of chunks to retrieve
+            k = min(10, len(chunks))  # Increased to 10 chunks
             
             if k > 0:
                 # Perform search
@@ -599,40 +613,46 @@ async def perform_rag(ctx, query: str, documents: List[str]) -> Dict[str, Any]:
                 from agent_prompts import RAG_PROMPT
                 chunks_text = "\n\n".join([f"Chunk {i+1}:\n{chunk}" for i, chunk in enumerate(top_chunks)])
                 
-                # Truncate if too long
-                if len(chunks_text) > 4000:
+                # Increased truncation limit for Gemini
+                if len(chunks_text) > 500000:
                     ctx.log.warning("Chunks text too long, truncating")
-                    chunks_text = chunks_text[:4000] + "...[truncated]"
+                    chunks_text = chunks_text[:500000] + "...[truncated]"
                 
                 prompt = RAG_PROMPT.format(
                     query=query,
                     chunks=chunks_text
                 )
                 
-                # Use OpenAI directly
-                ctx.log.info("Sending prompt to OpenAI for RAG generation")
+                # Use Gemini API instead of OpenAI
+                ctx.log.info("Sending prompt to Gemini API for RAG generation")
                 try:
-                    from openai import AsyncOpenAI
-                    openai_api_key = os.getenv('OPENAI_API_KEY')
-                    if not openai_api_key:
-                        raise ValueError("OPENAI_API_KEY environment variable not set")
-                        
-                    client = AsyncOpenAI(api_key=openai_api_key)
-                    completion = await client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.2,
-                        max_tokens=1000
-                    )
-                    response_text = completion.choices[0].message.content
-                    ctx.log.info("Successfully generated RAG response")
+                    gemini_api_key = os.getenv('GEMINI_API_KEY')
+                    if not gemini_api_key:
+                        raise ValueError("GEMINI_API_KEY environment variable not set")
+                    
+                    # Use httpx for async HTTP requests
+                    async with httpx.AsyncClient() as client:
+                        response = await client.post(
+                            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_api_key}",
+                            headers={'Content-Type': 'application/json'},
+                            json={
+                                "contents": [{
+                                    "parts": [{"text": prompt}]
+                                }]
+                            }
+                        )
+                        response.raise_for_status()
+                        result = response.json()
+                        response_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', 'No response generated')
+                    
+                    ctx.log.info("Successfully generated RAG response with Gemini")
                     
                 except Exception as e:
-                    ctx.log.error(f"OpenAI API error: {str(e)}")
+                    ctx.log.error(f"Gemini API error: {str(e)}")
                     ctx.log.error(traceback.format_exc())
                     
                     # Try fallback to Archon
-                    ctx.log.info("Attempting fallback to Archon")
+                    ctx.log.info("Attempting fallback to Archon after Gemini API failure")
                     try:
                         archon = ctx.deps.archon_client
                         if archon:
@@ -643,7 +663,7 @@ async def perform_rag(ctx, query: str, documents: List[str]) -> Dict[str, Any]:
                             response_text = archon_response.get('response', 'Failed to generate response')
                             ctx.log.info("Successfully generated RAG response via Archon fallback")
                         else:
-                            response_text = "Error generating response. OpenAI API error and Archon not available."
+                            response_text = "Error generating response. Gemini API error and Archon not available."
                     except Exception as e2:
                         ctx.log.error(f"Archon fallback also failed: {str(e2)}")
                         response_text = f"Error generating response: {str(e)}. Fallback also failed."
@@ -656,6 +676,7 @@ async def perform_rag(ctx, query: str, documents: List[str]) -> Dict[str, Any]:
                             'query': query,
                             'response': response_text,
                             'chunks_used': len(top_chunks),
+                            'model': 'gemini-2.0-flash',
                             'timestamp': datetime.now().isoformat()
                         }
                         
@@ -673,6 +694,7 @@ async def perform_rag(ctx, query: str, documents: List[str]) -> Dict[str, Any]:
                                 'query': query,
                                 'response': response_text,
                                 'chunks_used': len(top_chunks),
+                                'model': 'gemini-2.0-flash',
                                 'timestamp': datetime.now().isoformat()
                             }, f)
                         ctx.log.info("RAG result stored locally")
@@ -683,6 +705,7 @@ async def perform_rag(ctx, query: str, documents: List[str]) -> Dict[str, Any]:
                     'query': query,
                     'response': response_text,
                     'chunks_used': top_chunks,
+                    'model': 'gemini-2.0-flash',
                     'status': 'success'
                 }
             else:
@@ -709,6 +732,7 @@ async def perform_rag(ctx, query: str, documents: List[str]) -> Dict[str, Any]:
         return {
             'query': query,
             'response': f'Error performing RAG: {str(e)}',
+            'model': 'gemini-2.0-flash',
             'status': 'error'
         }
 
