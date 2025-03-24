@@ -1,0 +1,6 @@
+{
+  "query": "process campaign emails",
+  "intent": "[\"search_emails\"]",
+  "tools_used": [],
+  "results": {}
+}

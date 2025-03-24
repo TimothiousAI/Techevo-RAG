@@ -592,37 +592,32 @@ async def perform_rag(query: str, services: Dict, deps) -> Dict:
             logger.error(f"Traceback: {traceback.format_exc()}")
             rag_result = f"Error generating response: {str(e)}"
         
-        # Store result in Supabase if available
+        # Store RAG result in Supabase
         try:
-            if supabase:
-                logger.info("Storing RAG result in Supabase")
-                
+            logger.info("Storing RAG result in Supabase")
+            
+            # Prepare record
+            result = {
+                'query': query,
+                'result': rag_result,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Store in Supabase
+            for attempt in range(3):  # Retry up to 3 times
                 try:
-                    # Try using cursor.mcp.supabase
-                    import cursor.mcp.supabase as supabase_mcp
-                    record = {
-                        'query': query,
-                        'context_size': len(combined_context),
-                        'result': rag_result,
-                        'timestamp': datetime.now().isoformat()
-                    }
-                    
-                    result = await supabase_mcp.insert('rag_results', record)
-                    logger.info(f"RAG result stored in Supabase: {result}")
-                except Exception as mcp_error:
-                    logger.error(f"Error storing result via MCP: {mcp_error}")
-                    # Fallback to direct API
-                    record = {
-                        'query': query,
-                        'context_size': len(combined_context),
-                        'result': rag_result,
-                        'timestamp': datetime.now().isoformat()
-                    }
-                    
-                    result = supabase.table('rag_results').insert(record).execute()
-                    logger.info(f"RAG result stored in Supabase via direct API: {result}")
-        except Exception as db_error:
-            logger.error(f"Error storing RAG result in database: {db_error}")
+                    db_result = supabase.table('rag_results').insert(result).execute()
+                    logger.info(f"RAG result stored in Supabase: {db_result}")
+                    break
+                except Exception as retry_error:
+                    if attempt < 2:  # Only retry on first two attempts
+                        logger.warning(f"Retrying Supabase insert (attempt {attempt+1}): {retry_error}")
+                        await asyncio.sleep(1)
+                    else:
+                        # On final attempt, backup to local file
+                        raise
+        except Exception as storage_error:
+            logger.error(f"Error storing RAG result: {storage_error}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             
             # Backup to local file
@@ -630,22 +625,16 @@ async def perform_rag(query: str, services: Dict, deps) -> Dict:
                 os.makedirs('logs/rag_results', exist_ok=True)
                 backup_file = f"logs/rag_results/{int(time.time())}.json"
                 with open(backup_file, 'w') as f:
-                    json.dump({
-                        'query': query,
-                        'result': rag_result,
-                        'timestamp': datetime.now().isoformat()
-                    }, f)
+                    json.dump(result, f)
                 logger.info(f"RAG result backed up to {backup_file}")
             except Exception as backup_error:
                 logger.error(f"Error backing up RAG result: {backup_error}")
         
-        result = {
-            'answer': rag_result,
-            'context_used': len(context),
-            'context_size': len(combined_context)
+        return {
+            'status': 'success',
+            'result': rag_result,
+            'context_size': len(context)
         }
-        
-        return result
     
     except Exception as e:
         logger.error(f"Error in perform_rag: {e}")
@@ -672,28 +661,22 @@ async def track_progress(record: Dict, services: Dict) -> Dict:
     try:
         logger.info(f"Tracking progress: {record}")
         
-        try:
-            # Try using cursor.mcp.supabase
-            import cursor.mcp.supabase as supabase_mcp
+        # Add timestamp if not present
+        if 'timestamp' not in record:
+            record['timestamp'] = datetime.now().isoformat()
             
-            # Add timestamp if not present
-            if 'timestamp' not in record:
-                record['timestamp'] = datetime.now().isoformat()
-                
-            result = await supabase_mcp.insert('processed_items', record)
-            logger.info(f"Progress record stored in Supabase: {result}")
-            return result
-        except Exception as mcp_error:
-            logger.error(f"Error storing progress via MCP: {mcp_error}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            # Fallback to direct API
-            if 'timestamp' not in record:
-                record['timestamp'] = datetime.now().isoformat()
-                
-            result = supabase.table('processed_items').insert(record).execute()
-            logger.info(f"Progress record stored in Supabase via direct API: {result}")
-            return result
+        # Use direct Supabase client
+        for attempt in range(3):  # Retry up to 3 times
+            try:
+                result = supabase.table('processed_items').insert(record).execute()
+                logger.info(f"Progress record stored in Supabase: {result}")
+                return result.data
+            except Exception as retry_error:
+                if attempt < 2:  # Only retry on first two attempts
+                    logger.warning(f"Retrying Supabase insert (attempt {attempt+1}): {retry_error}")
+                    await asyncio.sleep(1)
+                else:
+                    raise  # Re-raise the exception on the last attempt
     except Exception as e:
         logger.error(f"Error tracking progress: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
@@ -708,4 +691,4 @@ async def track_progress(record: Dict, services: Dict) -> Dict:
             return {"status": "backed up locally", "file": backup_file}
         except Exception as backup_error:
             logger.error(f"Error backing up progress record: {backup_error}")
-            raise 
+            return {"status": "error", "error": str(e), "backup_error": str(backup_error)} 

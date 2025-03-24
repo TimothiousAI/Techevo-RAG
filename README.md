@@ -32,7 +32,7 @@ This project uses Cursor MCP for:
 ## Testing
 
 ### Test Results
-- Tested on March 21, 2025: Processed 5 emails, RAG output successful
+- Tested on March 24, 2025: No emails found, RAG not performed
 - Test query "process campaign emails" identified 3 campaign emails with 2 attachments
 - Supabase integration test: 3 entries saved to processed_items table, 1 to rag_results
 - Error handling verified: OpenAI fallback triggered successfully when MCP was unavailable

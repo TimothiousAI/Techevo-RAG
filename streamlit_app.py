@@ -20,7 +20,7 @@ from io import StringIO
 import streamlit as st
 from dotenv import load_dotenv
 import logfire
-from st_autorefresh import st_autorefresh
+from streamlit_autorefresh import st_autorefresh
 
 # Import agent components
 from agent import (
