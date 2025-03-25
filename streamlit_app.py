@@ -28,8 +28,7 @@ from agent import (
     setup_google_services, 
     create_faiss_index,
     ArchonClient,
-    validate_env_vars,
-    TechevoAgent
+    validate_env_vars
 )
 
 from supabase import create_client
