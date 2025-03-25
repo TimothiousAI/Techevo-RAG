@@ -292,11 +292,7 @@ async def run_agent_async(query: str, deps: EnhancedDeps):
 # Sync wrapper for running the agent
 def sync_run_agent(query: str, deps: EnhancedDeps):
     """Synchronous wrapper for running the agent."""
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        return loop.run_until_complete(run_agent_async(query, deps))
-    else:
-        return asyncio.run(run_agent_async(query, deps))
+    return asyncio.run(run_agent_async(query, deps))
 
 # Add a log message
 def add_log(message: str):
