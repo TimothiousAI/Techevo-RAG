@@ -605,14 +605,26 @@ class TechevoRagAgent:
                     'runtime': time.time() - started_at
                 }
             
-            # Initialize state
-            deps.state = {
-                'query': query,
+            # Ensure state persistence
+            deps.state = deps.state or {
+                'query': '',
                 'processed_emails': [],
                 'downloaded_attachments': [],
                 'rag_results': [],
                 'start_time': started_at
             }
+            
+            # Track downloaded attachment IDs for deduplication
+            downloaded_ids = set()
+            for a in deps.state.get('downloaded_attachments', []):
+                if a.get('drive_id'):
+                    downloaded_ids.add(a.get('drive_id'))
+                if a.get('attachment_id'):
+                    downloaded_ids.add(a.get('attachment_id'))
+            
+            # Store current query in state
+            deps.state['query'] = query
+            deps.state['start_time'] = started_at
             
             # Get intent with enhanced search parameters
             if 'archon' in self.services:
@@ -667,6 +679,9 @@ class TechevoRagAgent:
             ctx = AgentContext(agent=self, deps=deps, log=logger)
             
             # Run the workflow with available tools
+            max_retries = 3  # Default retries for operations
+            
+            # Process each tool based on intent
             for tool in intent_tools:
                 if tool in self.available_tools:
                     logger.info(f"Running tool: {tool}")
@@ -701,8 +716,8 @@ class TechevoRagAgent:
                             result['data']['emails'] = {"status": "error", "error": str(e)}
                     
                     elif tool == 'download_attachment':
-                        attachment_results = []
-                        downloaded_ids = set()  # Track downloaded attachment IDs
+                        # Initialize attachments list from state for persistence
+                        attachment_results = deps.state.get('downloaded_attachments', [])
                         
                         # Try to find emails if not already in state
                         if not deps.state.get('processed_emails'):
@@ -740,50 +755,61 @@ class TechevoRagAgent:
                                     continue
                             
                             # Process each email's attachments with retry mechanism
-                            max_retries = 3
                             for email in deps.state['processed_emails']:
                                 if email.get('attachments'):
                                     for attachment in email.get('attachments', []):
                                         attachment_id = attachment.get('id')
-                                        if attachment_id and attachment_id not in downloaded_ids:
-                                            success = False
-                                            # Try up to max_retries times
-                                            for attempt in range(max_retries):
-                                                try:
-                                                    # Download and upload attachment
-                                                    download_result = await tool_func(
-                                                        ctx,
-                                                        email_id=email['id'],
-                                                        attachment_id=attachment_id,
-                                                        folder_id=folder_id
-                                                    )
-                                                    
-                                                    if download_result['status'] == 'success':
-                                                        downloaded_ids.add(attachment_id)
-                                                        attachment_results.append(download_result)
-                                                        logger.info(f"Successfully processed attachment: {download_result['filename']} (attempt {attempt+1})")
-                                                        success = True
-                                                        break
-                                                    elif download_result['status'] == 'skipped':
-                                                        logger.info(f"Skipped non-true attachment: {download_result.get('filename', 'unknown')}")
-                                                        attachment_results.append(download_result)
-                                                        success = True
-                                                        break
-                                                    else:
-                                                        logger.warning(f"Attempt {attempt+1} failed for attachment {attachment_id}: {download_result.get('error', 'Unknown error')}")
-                                                        if attempt == max_retries - 1:
-                                                            attachment_results.append(download_result)
-                                                            logger.error(f"Max retries reached for attachment {attachment_id}")
-                                                except Exception as e:
-                                                    logger.error(f"Error on attempt {attempt+1} for attachment {attachment_id}: {str(e)}")
+                                        
+                                        # Skip if already downloaded
+                                        if attachment_id and attachment_id in downloaded_ids:
+                                            logger.info(f"Skipping already downloaded attachment: {attachment.get('filename', 'unknown')}")
+                                            continue
+                                            
+                                        # Try up to max_retries times
+                                        for attempt in range(max_retries):
+                                            try:
+                                                # Download and upload attachment
+                                                download_result = await tool_func(
+                                                    ctx,
+                                                    email_id=email['id'],
+                                                    attachment_id=attachment_id,
+                                                    folder_id=folder_id
+                                                )
+                                                
+                                                # Add email_id and attachment_id for reference
+                                                download_result['email_id'] = email['id']
+                                                download_result['attachment_id'] = attachment_id
+                                                download_result['email_subject'] = email.get('subject', 'Unknown')
+                                                download_result['email_from'] = email.get('from', 'Unknown')
+                                                
+                                                if download_result['status'] == 'success':
+                                                    downloaded_ids.add(attachment_id)
+                                                    if download_result.get('drive_id'):
+                                                        downloaded_ids.add(download_result['drive_id'])
+                                                    attachment_results.append(download_result)
+                                                    logger.info(f"Successfully processed attachment: {download_result['filename']} (attempt {attempt+1})")
+                                                    break
+                                                elif download_result['status'] == 'skipped':
+                                                    logger.info(f"Skipped non-true attachment: {download_result.get('filename', 'unknown')}")
+                                                    attachment_results.append(download_result)
+                                                    break
+                                                else:
+                                                    logger.warning(f"Attempt {attempt+1} failed for attachment {attachment_id}: {download_result.get('error', 'Unknown error')}")
                                                     if attempt == max_retries - 1:
-                                                        attachment_results.append({
-                                                            'status': 'error',
-                                                            'error': str(e),
-                                                            'email_id': email['id'],
-                                                            'attachment_id': attachment_id,
-                                                            'filename': attachment.get('filename', 'unknown')
-                                                        })
+                                                        attachment_results.append(download_result)
+                                                        logger.error(f"Max retries reached for attachment {attachment_id}")
+                                            except Exception as e:
+                                                logger.error(f"Error on attempt {attempt+1} for attachment {attachment_id}: {str(e)}")
+                                                if attempt == max_retries - 1:
+                                                    attachment_results.append({
+                                                        'status': 'error',
+                                                        'error': str(e),
+                                                        'email_id': email['id'],
+                                                        'attachment_id': attachment_id,
+                                                        'filename': attachment.get('filename', 'unknown'),
+                                                        'email_subject': email.get('subject', 'Unknown'),
+                                                        'email_from': email.get('from', 'Unknown')
+                                                    })
                             
                             result['data']['attachments'] = attachment_results
                             deps.state['downloaded_attachments'] = attachment_results
@@ -816,64 +842,126 @@ class TechevoRagAgent:
                             logger.error(f"Error searching Drive: {str(e)}")
                             result['data']['drive_files'] = {"status": "error", "error": str(e)}
                     
-                    elif tool == 'perform_rag':
+                    elif tool == 'perform_rag' or 'summarize' in query.lower() or 'analyze' in query.lower():
+                        # Collect documents from various sources
                         documents = []
+                        document_sources = []
                         
                         # Collect documents from emails
-                        if 'processed_emails' in deps.state and deps.state['processed_emails']:
-                            for email in deps.state['processed_emails']:
+                        if deps.state.get('processed_emails'):
+                            for email in deps.state.get('processed_emails'):
                                 if email.get('body'):
                                     documents.append(email.get('body'))
+                                    document_sources.append({
+                                        'type': 'email',
+                                        'id': email.get('id'),
+                                        'subject': email.get('subject', 'Unknown'),
+                                        'from': email.get('from', 'Unknown')
+                                    })
                         
-                        # Collect documents from attachments
-                        if 'attachments_content' in deps.state and deps.state['attachments_content']:
-                            for filename, content in deps.state['attachments_content'].items():
+                        # Collect documents from downloaded attachments
+                        if deps.state.get('downloaded_attachments'):
+                            for attachment in deps.state.get('downloaded_attachments'):
+                                if attachment.get('status') == 'success':
+                                    # TODO: Add actual content extraction from Drive files
+                                    # For now, just record the metadata
+                                    document_sources.append({
+                                        'type': 'attachment',
+                                        'id': attachment.get('drive_id'),
+                                        'filename': attachment.get('filename', 'Unknown'),
+                                        'mime_type': attachment.get('mime_type', 'Unknown'),
+                                        'email_id': attachment.get('email_id')
+                                    })
+                        
+                        # Placeholder for document text extraction
+                        # This would be replaced with actual extraction logic
+                        if deps.state.get('attachments_content'):
+                            for filename, content in deps.state.get('attachments_content').items():
                                 if isinstance(content, bytes):
                                     try:
                                         text = content.decode('utf-8', errors='ignore')
                                         documents.append(text)
-                                    except:
-                                        logger.warning(f"Could not decode attachment content for {filename}")
+                                        document_sources.append({
+                                            'type': 'extracted_content',
+                                            'filename': filename
+                                        })
+                                    except Exception as decode_err:
+                                        logger.warning(f"Could not decode content for {filename}: {str(decode_err)}")
                                 elif isinstance(content, str):
                                     documents.append(content)
+                                    document_sources.append({
+                                        'type': 'extracted_content',
+                                        'filename': filename
+                                    })
                         
-                        # Collect documents from Drive
-                        if 'drive_contents' in deps.state and deps.state['drive_contents']:
-                            for file_id, content in deps.state['drive_contents'].items():
-                                if content:
-                                    documents.append(content)
-                        
-                        if documents:
+                        if documents or 'summarize' in query.lower() or 'analyze' in query.lower():
                             try:
-                                # Create a sub-agent through Archon for RAG processing
+                                # Create a sub-agent through Archon for RAG or summarization
                                 rag_sub_agent_id = None
+                                
                                 if 'archon' in self.services:
                                     try:
+                                        # More specific skills based on query
+                                        skills = ['text_extraction', 'vector_indexing', 'rag_processing']
+                                        
+                                        # Add specific skills based on query intent
+                                        if 'summarize' in query.lower():
+                                            skills.append('text_summarization')
+                                        if 'analyze' in query.lower():
+                                            skills.append('data_analysis') 
+                                        
+                                        task_description = 'Process documents and perform RAG'
+                                        if 'summarize' in query.lower():
+                                            task_description = 'Summarize content from emails and attachments'
+                                        elif 'analyze' in query.lower():
+                                            task_description = 'Analyze content from emails and attachments'
+                                        
                                         rag_sub_agent_id = await self.services['archon'].create_agent(
-                                            skills=['text_extraction', 'vector_indexing', 'rag_processing'],
+                                            skills=skills,
                                             level='sub-agent',
-                                            task='Process documents and perform RAG'
+                                            task=task_description,
+                                            name='rag_processor'
                                         )
                                         logger.info(f"Created RAG sub-agent with ID: {rag_sub_agent_id}")
                                     except Exception as e:
                                         logger.error(f"Failed to create RAG sub-agent: {str(e)}")
+                                        logger.error(f"Traceback: {traceback.format_exc()}")
                                 
                                 # Perform RAG with the main tool or use the sub-agent
                                 if rag_sub_agent_id:
                                     # Use the sub-agent to process documents
-                                    logger.info(f"Using RAG sub-agent {rag_sub_agent_id} to process {len(documents)} documents")
+                                    logger.info(f"Using RAG sub-agent {rag_sub_agent_id} to process content")
+                                    
+                                    # Prepare document summary for sub-agent
+                                    document_summary = []
+                                    for i, source in enumerate(document_sources):
+                                        document_summary.append({
+                                            'index': i,
+                                            'type': source.get('type'),
+                                            'id': source.get('id', 'unknown'),
+                                            'metadata': {k: v for k, v in source.items() if k not in ['type', 'id']}
+                                        })
                                     
                                     # Prepare a simplified request for the sub-agent
                                     rag_request = {
                                         'query': query,
                                         'document_count': len(documents),
-                                        'document_sample': documents[0][:500] + "..." if documents else ""
+                                        'document_sources': document_summary,
+                                        'document_sample': documents[0][:500] + "..." if documents else "",
                                     }
+                                    
+                                    # Additional details for summarization/analysis
+                                    if 'summarize' in query.lower():
+                                        rag_request['operation'] = 'summarize'
+                                    elif 'analyze' in query.lower():
+                                        rag_request['operation'] = 'analyze'
+                                    else:
+                                        rag_request['operation'] = 'rag'
                                     
                                     # Run the sub-agent via Archon
                                     sub_agent_response = await self.services['archon'].run_agent(
                                         thread_id=self.services['archon'].thread_id,
-                                        user_input=f"Process these documents for RAG: {json.dumps(rag_request)}"
+                                        user_input=f"Process content with this request: {json.dumps(rag_request)}"
                                     )
                                     
                                     # Store the sub-agent result
@@ -881,39 +969,62 @@ class TechevoRagAgent:
                                         'query': query,
                                         'response': sub_agent_response,
                                         'document_count': len(documents),
+                                        'document_sources': document_summary,
                                         'status': 'success',
-                                        'processed_by': f'sub-agent:{rag_sub_agent_id}'
+                                        'processed_by': f'sub-agent:{rag_sub_agent_id}',
+                                        'operation': rag_request.get('operation', 'rag')
                                     }
                                 else:
                                     # Fall back to the built-in RAG tool
                                     logger.info(f"Performing RAG on {len(documents)} documents with built-in tool")
-                                    rag_result = await tool_func(ctx, query, documents)
+                                    
+                                    # For summarization or analysis without sub-agent, use custom prompt
+                                    if 'summarize' in query.lower() or 'analyze' in query.lower():
+                                        # Custom prompt for summarization/analysis
+                                        custom_query = query
+                                        if 'summarize' in query.lower() and not query.startswith('summarize'):
+                                            custom_query = f"Summarize the following content: {query}"
+                                        elif 'analyze' in query.lower() and not query.startswith('analyze'):
+                                            custom_query = f"Analyze the following content: {query}"
+                                        
+                                        rag_result = await tool_func(ctx, custom_query, documents)
+                                        rag_result['operation'] = 'summarize' if 'summarize' in query.lower() else 'analyze'
+                                    else:
+                                        rag_result = await tool_func(ctx, query, documents)
+                                        rag_result['operation'] = 'rag'
+                                    
+                                    # Add document sources for tracking
+                                    rag_result['document_sources'] = document_sources
                                 
                                 result['data']['rag_result'] = rag_result
                                 deps.state['rag_results'] = rag_result
                                 
                                 # Log RAG results
-                                logfire.info("RAG results",
+                                logfire.info("RAG/Analysis results",
                                     query=query,
                                     document_count=len(documents),
+                                    operation=rag_result.get('operation', 'rag'),
                                     chunks_used=len(rag_result.get('chunks_used', [])) if 'chunks_used' in rag_result else 0,
                                     status=rag_result.get('status'),
                                     processor=rag_result.get('processed_by', 'built-in'),
                                     response_length=len(rag_result.get('response', ''))
                                 )
                             except Exception as e:
-                                logger.error(f"Error performing RAG: {str(e)}")
+                                logger.error(f"Error performing RAG/Analysis: {str(e)}")
+                                logger.error(traceback.format_exc())
                                 result['data']['rag_result'] = {
                                     'query': query,
-                                    'response': f'Error performing RAG: {str(e)}',
+                                    'response': f'Error processing content: {str(e)}',
                                     'chunks_used': [],
-                                    'status': 'error'
+                                    'status': 'error',
+                                    'error': str(e),
+                                    'traceback': traceback.format_exc()
                                 }
                         else:
-                            logger.warning("No documents available for RAG processing.")
+                            logger.warning("No content available for RAG/Analysis processing.")
                             result['data']['rag_result'] = {
                                 'query': query,
-                                'response': 'No documents available to process.',
+                                'response': 'No content available to process.',
                                 'chunks_used': [],
                                 'status': 'no_data'
                             }
@@ -960,8 +1071,11 @@ class TechevoRagAgent:
                                 }
                                 
                                 # Execute synchronous insert for each attachment
-                                attachment_response = deps.supabase.table('attachment_items').insert(attachment_record).execute()
-                                logger.info(f"Supabase attachment insert response: {attachment_response}")
+                                try:
+                                    attachment_response = deps.supabase.table('attachment_items').insert(attachment_record).execute()
+                                    logger.info(f"Supabase attachment insert response: {attachment_response}")
+                                except Exception as attachment_error:
+                                    logger.error(f"Failed to store attachment in Supabase: {str(attachment_error)}")
                     
                     # Create a simplified record for storage with email_count
                     record = {
@@ -973,13 +1087,44 @@ class TechevoRagAgent:
                         'success_attachments': sum(1 for a in result['data'].get('attachments', []) if a.get('status') == 'success'),
                         'has_rag_result': 'rag_result' in result['data'],
                         'status': 'completed',
-                        'runtime': time.time() - started_at,
-                        'result': json.dumps(result['data'], default=str)  # Store full result as JSON
+                        'runtime': time.time() - started_at
                     }
                     
+                    # Only add summary of result data to avoid JSON size issues
+                    result_summary = {}
+                    if 'emails' in result['data']:
+                        result_summary['email_count'] = len(result['data']['emails'])
+                    if 'attachments' in result['data']:
+                        result_summary['attachment_count'] = len(result['data']['attachments'])
+                    if 'rag_result' in result['data']:
+                        result_summary['rag_status'] = result['data']['rag_result'].get('status')
+                        # Only include the first 1000 characters of the response
+                        rag_response = result['data']['rag_result'].get('response', '')
+                        if isinstance(rag_response, str) and len(rag_response) > 1000:
+                            result_summary['rag_response'] = rag_response[:1000] + "..."
+                        else:
+                            result_summary['rag_response'] = rag_response
+                    
+                    record['result_summary'] = json.dumps(result_summary, default=str)
+                    
                     # Execute synchronous insert
-                    insert_response = deps.supabase.table('processed_items').insert(record).execute()
-                    logger.info(f"Supabase insert response: {insert_response}")
+                    try:
+                        insert_response = deps.supabase.table('processed_items').insert(record).execute()
+                        logger.info(f"Supabase insert response: {insert_response}")
+                    except Exception as insert_error:
+                        logger.error(f"Failed to store main record in Supabase: {str(insert_error)}")
+                        try:
+                            # Try again with a simpler record
+                            simplified_record = {
+                                'query': query,
+                                'timestamp': datetime.now().isoformat(),
+                                'status': 'completed',
+                                'runtime': time.time() - started_at
+                            }
+                            retry_insert = deps.supabase.table('processed_items').insert(simplified_record).execute()
+                            logger.info(f"Simplified Supabase insert response: {retry_insert}")
+                        except Exception as retry_error:
+                            logger.error(f"Failed to store simplified record: {str(retry_error)}")
                     
                 except Exception as e:
                     logger.error(f"Failed to store result in Supabase: {str(e)}")

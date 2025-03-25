@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional
 import logging
 import time
 import traceback
+import uuid
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -27,10 +28,12 @@ from agent import (
     setup_google_services, 
     create_faiss_index,
     ArchonClient,
-    validate_env_vars
+    validate_env_vars,
+    TechevoAgent
 )
 
 from supabase import create_client
+from services import initialize_gmail_service, initialize_drive_service, initialize_supabase, initialize_archon
 
 # Configure logfire with current arguments
 logfire.configure(
@@ -56,10 +59,14 @@ if 'initialized' not in st.session_state:
     st.session_state.chat_history = []
     st.session_state.last_refresh = time.time()
 
+# Create a unique session ID
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
 # Streamlit app setup
 st.set_page_config(
-    page_title="Techevo-RAG",
-    page_icon="📊",
+    page_title="Techevo RAG",
+    page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -311,7 +318,7 @@ def add_log(message: str):
     # Also log to logfire for cloud logging
     logfire.info(message)
 
-st.title("📊 Techevo-RAG Chat Interface")
+st.title("📊 Techevo RAG System")
 st.markdown("""
 This system allows you to interact with AI agents for email searching, attachment downloading, Google Drive searching, and RAG processing.
 Enter a request below to get started (e.g., "find all emails with attachments from eman.abou_arab@bell.ca", "process campaign emails", "summarize quarterly reports").
