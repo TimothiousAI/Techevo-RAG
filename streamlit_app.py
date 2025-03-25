@@ -18,6 +18,7 @@ import uuid
 import streamlit as st
 from dotenv import load_dotenv
 import logfire
+import httpx
 
 # Load environment variables first thing
 load_dotenv(dotenv_path=".env", verbose=True)
@@ -32,7 +33,6 @@ from agent import (
 )
 
 from supabase import create_client
-from services import initialize_gmail_service, initialize_drive_service, initialize_supabase, initialize_archon
 
 # Configure logfire with current arguments
 logfire.configure(
@@ -117,56 +117,11 @@ def initialize_services():
         validate_env_vars()
         
         # Set up Google services
-        gmail_service = None
-        drive_service = None
-        
-        # Load credentials
-        credentials_path = os.getenv('CREDENTIALS_JSON_PATH')
-        if not credentials_path:
-            logger.error("CREDENTIALS_JSON_PATH not set in environment")
-            raise ValueError("CREDENTIALS_JSON_PATH environment variable is required")
-        
-        if not os.path.exists(credentials_path):
-            logger.error(f"Credentials file not found at {credentials_path}")
-            raise ValueError(f"Credentials file not found at {credentials_path}")
-        
-        # Synchronous setup for Google services
-        from googleapiclient.discovery import build
-        from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from google.auth.transport.requests import Request
-        
-        # Define scopes
-        SCOPES = [
-            'https://www.googleapis.com/auth/gmail.readonly',
-            'https://www.googleapis.com/auth/drive',
-            'https://www.googleapis.com/auth/drive.file',
-            'https://www.googleapis.com/auth/drive.readonly'
-        ]
-        
-        creds = None
-        token_path = 'token.json'
-        
-        # Load existing token
-        if os.path.exists(token_path):
-            creds = Credentials.from_authorized_user_info(json.load(open(token_path)))
-        
-        # Refresh token if needed
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            with open(token_path, 'w') as token:
-                token.write(creds.to_json())
-        
-        # If no valid credentials available, log error
-        if not creds or not creds.valid:
-            logger.error("No valid credentials found. Please run setup_google.py first")
-            st.error("No valid Google credentials found. Please run setup_google.py first")
-        else:
-            # Build Gmail and Drive services
-            gmail_service = build('gmail', 'v1', credentials=creds)
-            drive_service = build('drive', 'v3', credentials=creds)
-            logger.info("Google services initialized successfully")
-        
+        gmail_service, drive_service = setup_google_services()
+        if not gmail_service or not drive_service:
+            logger.error("Failed to initialize Google services")
+            return None, None, None, None, None, None
+            
         # Create FAISS index
         faiss_index = create_faiss_index(dimension=768)  # Use correct dimension for all-MiniLM-L6-v2
         
@@ -174,88 +129,22 @@ def initialize_services():
         from sentence_transformers import SentenceTransformer
         embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Set up Supabase client with more robust credential handling
-        # Try direct environment variables first
-        supabase_url = os.getenv('SUPABASE_URL')
-        supabase_key = os.getenv('SUPABASE_KEY')
-        
-        # If credentials not found, try to directly read from .env file
-        if not supabase_url or not supabase_key:
-            import re
-            env_path = os.path.join(os.getcwd(), '.env')
-            if os.path.exists(env_path):
-                logger.info(f"Found .env file at {env_path}, reading directly")
-                with open(env_path, 'r') as f:
-                    env_content = f.read()
-                    # Extract Supabase URL using regex
-                    url_match = re.search(r'SUPABASE_URL\s*=\s*(.*?)(?:\n|$)', env_content)
-                    if url_match:
-                        supabase_url = url_match.group(1).strip()
-                        logger.info(f"Extracted SUPABASE_URL: {supabase_url[:10]}...")
-                    # Extract Supabase key using regex
-                    key_match = re.search(r'SUPABASE_KEY\s*=\s*(.*?)(?:\n|$)', env_content)
-                    if key_match:
-                        supabase_key = key_match.group(1).strip()
-                        logger.info(f"Extracted SUPABASE_KEY: {supabase_key[:5]}...")
-        
-        # Check if we have valid credentials now
-        if not supabase_url or not supabase_key:
-            logger.error("SUPABASE_URL or SUPABASE_KEY is missing in .env")
-            st.error("Supabase credentials missing. Check your .env file.")
-            supabase = None
-        else:
-            try:
-                # Create synchronous Supabase client
-                logger.info(f"Creating Supabase client with URL starting with: {supabase_url[:10]}...")
-                supabase = create_client(supabase_url, supabase_key)
-                # Validate connection by making a simple query
-                result = supabase.table('processed_items').select('id').limit(1).execute()
-                logger.info("Supabase connection validated successfully")
-                st.success("✅ Supabase connection successful!")
-            except Exception as e:
-                logger.error(f"Supabase connection failed: {str(e)}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                # Continue without Supabase
-                supabase = None
-                st.error(f"❌ Supabase connection error: {str(e)}")
-                logger.warning("Continuing without Supabase connection")
+        # Set up Supabase client
+        supabase = initialize_supabase()
+        if not supabase:
+            logger.warning("Continuing without Supabase connection")
         
         # Set up Archon client
-        try:
-            # Create synchronous version of Archon client if needed
-            archon_client = ArchonClient(
-                api_key=os.getenv('OPENAI_API_KEY'),
-                api_base=os.getenv('OPENAI_API_BASE')
-            )
-            # For synchronous operation, we'll create the thread when needed
-            logger.info(f"Archon client created")
-        except Exception as e:
-            logger.error(f"Error setting up Archon client: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            # Continue without Archon, will use OpenAI directly
-            archon_client = None
-            logger.warning("Continuing without Archon client")
+        archon_client = initialize_archon()
+        if not archon_client:
+            logger.warning("Continuing without Archon MCP client")
         
-        # Create dependencies object
-        deps = EnhancedDeps(
-            gmail_service=gmail_service,
-            drive_service=drive_service,
-            faiss_index=faiss_index,
-            supabase=supabase,
-            archon_client=archon_client,
-            state={}
-        )
+        logger.info("All services initialized successfully")
+        return gmail_service, drive_service, faiss_index, embedding_model, supabase, archon_client
         
-        # Add embedding model to deps
-        deps.state['embedding_model'] = embedding_model
-        
-        return gmail_service, drive_service, faiss_index, supabase, archon_client, deps
-    
     except Exception as e:
-        error_msg = f"Error initializing services: {str(e)}"
-        logger.error(error_msg)
-        logfire.error(error_msg)
-        st.error(error_msg)
+        logger.error(f"Error initializing services: {str(e)}")
+        logger.error(traceback.format_exc())
         return None, None, None, None, None, None
 
 # Async function to run the agent
@@ -295,10 +184,35 @@ async def run_agent_async(query: str, deps: EnhancedDeps):
             'query': query
         }
 
-# Sync wrapper for running the agent
-def sync_run_agent(query: str, deps: EnhancedDeps):
-    """Synchronous wrapper for running the agent."""
-    return asyncio.run(run_agent_async(query, deps))
+# Function to run the agent synchronously
+def sync_run_agent(query, deps):
+    """
+    Run the agent workflow synchronously.
+    
+    Args:
+        query: The user's query
+        deps: The dependencies object
+    
+    Returns:
+        The result of the agent workflow
+    """
+    try:
+        add_log(f"Processing query: {query}")
+        if not st.session_state.agent:
+            st.error("Agent not initialized")
+            add_log("Agent not initialized", level="error")
+            return {"status": "error", "error": "Agent not initialized"}
+        
+        # Run the agent workflow
+        result = st.session_state.agent.run_workflow_sync(query, deps)
+        add_log(f"Query processed successfully in {result.get('runtime', 0):.2f} seconds")
+        return result
+    except Exception as e:
+        error_msg = f"Error running agent: {str(e)}"
+        add_log(error_msg, level="error")
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        return {"status": "error", "error": error_msg}
 
 # Add a log message
 def add_log(message: str):
@@ -328,175 +242,159 @@ st.sidebar.title("📝 System Status")
 status_container = st.sidebar.container()
 log_container = st.sidebar.container()
 
-# Initialize services synchronously within Streamlit's main loop
-if not st.session_state.initialized:
+# Initialize the agent and dependencies
+if "initialized" not in st.session_state or not st.session_state.initialized:
     with st.spinner("Initializing services..."):
-        # Use synchronous initialization
+        add_log("Initializing services...")
+        
         (
             st.session_state.gmail_service,
             st.session_state.drive_service,
             st.session_state.faiss_index,
+            st.session_state.embedding_model,
             st.session_state.supabase,
-            st.session_state.archon_client,
-            st.session_state.deps
+            st.session_state.archon_client
         ) = initialize_services()
-        if st.session_state.deps is not None:
+        
+        # Create dependencies object
+        if st.session_state.gmail_service and st.session_state.drive_service:
+            st.session_state.deps = EnhancedDeps(
+                gmail_service=st.session_state.gmail_service,
+                drive_service=st.session_state.drive_service,
+                supabase=st.session_state.supabase,
+                services={"archon": st.session_state.archon_client} if st.session_state.archon_client else {},
+                state=st.session_state.get('state', {})
+            )
+            
+            # Store embedding model in state
+            if st.session_state.embedding_model:
+                st.session_state.deps.state['embedding_model'] = st.session_state.embedding_model
+            
+            # Initialize agent
+            st.session_state.agent = TechevoRagAgent()
             st.session_state.initialized = True
             add_log("Services initialized successfully")
-            status_container.success("✅ All services connected")
         else:
-            st.error("Failed to initialize services. Check logs for details.")
-            add_log("Failed to initialize services")
-            status_container.error("❌ Service initialization failed")
+            st.error("Failed to initialize required services")
+            add_log("Failed to initialize services", level="error")
 
 if st.session_state.initialized:
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("### Services")
-        if st.session_state.gmail_service:
-            st.success("✅ Gmail API")
-        else:
-            st.error("❌ Gmail API")
-        if st.session_state.drive_service:
-            st.success("✅ Drive API")
-        else:
-            st.error("❌ Drive API")
-    with col2:
-        st.markdown("### Database")
-        if st.session_state.supabase:
-            st.success("✅ Supabase")
-        else:
-            st.error("❌ Supabase")
-        if st.session_state.archon_client:
-            st.success("✅ Archon Client")
-        else:
-            st.error("❌ Archon Client")
-    with col3:
-        st.markdown("### Components")
-        if st.session_state.faiss_index:
-            st.success("✅ FAISS Index")
-        else:
-            st.error("❌ FAISS Index")
-
-    # Chat Interface
-    st.markdown("### Chat with Techevo-RAG")
+    st.title("Techevo RAG Agent")
     
-    # Display chat history
-    for message in st.session_state.chat_history:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    # Chat input
-    if not st.session_state.processing:
-        user_input = st.chat_input("Enter your request (e.g., 'find all emails with attachments from eman.abou_arab@bell.ca')")
-        if user_input:
-            # Add user message to chat
-            with st.chat_message("user"):
-                st.markdown(user_input)
-            st.session_state.chat_history.append({"role": "user", "content": user_input})
+    # User input
+    query = st.text_input(
+        "Enter your query",
+        placeholder="E.g., find all emails with attachments from eman.abou_arab@bell.ca in 2025",
+        key="user_query"
+    )
+    
+    col1, col2 = st.columns([1, 4])
+    process_button = col1.button("Process Query")
+    reset_button = col2.button("Reset")
+    
+    if reset_button:
+        st.session_state.user_query = ""
+        st.experimental_rerun()
+    
+    if process_button and query:
+        with st.spinner("Processing your query..."):
+            # Run the agent
+            result = sync_run_agent(query, st.session_state.deps)
             
-            # Process the request
-            st.session_state.processing = True
-            with st.spinner("Processing your request..."):
-                add_log(f"Running query: {user_input}")
-                status_container.info("⏳ Processing query...")
-                
-                # Create placeholder for streaming assistant response
-                with st.chat_message("assistant"):
-                    response_placeholder = st.empty()
-                    response_placeholder.markdown("_Processing your request..._")
-                
-                # Run the agent with proper async handling
-                result = sync_run_agent(user_input, st.session_state.deps)
-                st.session_state.results = result
-                
-                # Log completion
-                add_log(f"Query completed with status: {result.get('status', 'unknown')}")
-                if result.get('status') == 'success':
-                    status_container.success(f"✅ Query completed successfully")
-                else:
-                    status_container.error(f"❌ Query failed: {result.get('error', 'Unknown error')}")
+            # Store state for persistence
+            st.session_state.state = st.session_state.deps.state
             
-            # Update processing flag
-            st.session_state.processing = False
-            
-            # Format and display the response
-            if result.get('status') == 'success':
-                data = result.get('data', {})
-                response_text = "Here are the results:\n\n"
+            # Display result
+            if result.get("status") == "success":
+                st.success("Query processed successfully")
                 
-                # Handle email results
-                if 'emails' in data and data['emails']:
-                    response_text += f"**Emails Found ({len(data['emails'])}):**\n"
-                    for i, email in enumerate(data['emails'][:5]):  # Show max 5 emails
-                        response_text += f"- **Subject:** {email.get('subject', 'No Subject')}\n"
-                        response_text += f"  **From:** {email.get('from', 'Unknown')}\n"
-                        response_text += f"  **Date:** {email.get('date', 'Unknown')}\n"
-                        
-                        # Show attachments if present
-                        if email.get('attachments'):
-                            attachment_names = [a.get('filename', 'Unnamed') for a in email.get('attachments', [])]
-                            response_text += f"  **Attachments:** {', '.join(attachment_names)}\n"
-                        
-                        # Only show snippet of email body
-                        if email.get('body'):
-                            body_preview = email['body'][:200].replace('\n', ' ').strip() + "..."
-                            response_text += f"  **Preview:** {body_preview}\n\n"
-                        else:
-                            response_text += "\n"
-                            
-                    if len(data['emails']) > 5:
-                        response_text += f"_{len(data['emails']) - 5} more emails found..._\n\n"
+                # Create tabs for different result types
+                tabs = st.tabs(["RAG Results", "Emails", "Attachments", "Raw Result"])
                 
-                # Handle attachment results
-                if 'attachments' in data and data['attachments']:
-                    response_text += f"**Attachments Downloaded ({len(data['attachments'])}):**\n"
-                    for attachment in data['attachments']:
-                        if attachment.get('status') == 'error':
-                            response_text += f"- ❌ **{attachment.get('filename', 'Unknown')}**: {attachment.get('error', 'Unknown error')}\n"
-                        else:
-                            drive_link = attachment.get('drive_link', 'N/A')
-                            response_text += f"- ✅ **{attachment.get('filename', 'Unknown')}** - [View in Drive]({drive_link})\n"
-                    response_text += "\n"
-                
-                # Handle drive files results
-                if 'drive_files' in data and data['drive_files']:
-                    response_text += f"**Drive Files Found ({len(data['drive_files'])}):**\n"
-                    for i, file in enumerate(data['drive_files'][:5]):  # Show max 5 files
-                        file_type = file.get('mimeType', 'Unknown').split('/')[-1]
-                        web_link = file.get('webViewLink', '#')
-                        response_text += f"- [{file.get('name', 'Unnamed')}]({web_link}) - {file_type}\n"
-                        
-                    if len(data['drive_files']) > 5:
-                        response_text += f"_{len(data['drive_files']) - 5} more files found..._\n\n"
-                
-                # Handle RAG results - this is the most important part
-                if 'rag_result' in data:
-                    rag_result = data['rag_result']
-                    if rag_result.get('status') == 'success':
-                        response_text += f"**Analysis Results:**\n\n{rag_result.get('response', 'No response generated')}\n"
+                # RAG Results tab
+                with tabs[0]:
+                    if "data" in result and "rag_result" in result["data"]:
+                        rag_result = result["data"]["rag_result"]
+                        st.subheader("RAG Response")
+                        st.write(rag_result.get("response", "No RAG response generated"))
                     else:
-                        response_text += f"**Analysis Error:** {rag_result.get('error', 'Unknown error processing your request')}\n"
+                        st.info("No RAG results available")
                 
-                # Include execution time if available
-                if 'runtime' in result:
-                    response_text += f"\n_Request processed in {result.get('runtime'):.2f} seconds_"
+                # Emails tab
+                with tabs[1]:
+                    if "data" in result and "emails" in result["data"]:
+                        emails = result["data"]["emails"]
+                        if emails:
+                            st.subheader(f"Found {len(emails)} emails")
+                            for i, email in enumerate(emails):
+                                with st.expander(f"{email.get('subject', 'No Subject')} - {email.get('from', 'Unknown')}"):
+                                    st.write(f"**From:** {email.get('from', 'Unknown')}")
+                                    st.write(f"**Subject:** {email.get('subject', 'No Subject')}")
+                                    st.write(f"**Date:** {email.get('date', 'Unknown')}")
+                                    
+                                    # Show attachments
+                                    if email.get("attachments"):
+                                        st.write(f"**Attachments:** {len(email['attachments'])}")
+                                        for att in email["attachments"]:
+                                            st.write(f"- {att.get('filename', 'Unknown')}")
+                                    
+                                    # Show body
+                                    st.write("**Body:**")
+                                    st.write(email.get("body", "No body"))
+                        else:
+                            st.info("No emails found")
+                    else:
+                        st.info("No email results available")
                 
-                # Update the placeholder with the final response
-                response_placeholder.markdown(response_text)
+                # Attachments tab
+                with tabs[2]:
+                    if "data" in result and "attachments" in result["data"]:
+                        attachments = result["data"]["attachments"]
+                        if attachments:
+                            st.subheader(f"Processed {len(attachments)} attachments")
+                            
+                            # Count by status
+                            success = sum(1 for a in attachments if a.get("status") == "success")
+                            skipped = sum(1 for a in attachments if a.get("status") == "skipped")
+                            error = sum(1 for a in attachments if a.get("status") == "error")
+                            
+                            st.write(f"Success: {success}, Skipped: {skipped}, Error: {error}")
+                            
+                            # Show successful attachments
+                            if success > 0:
+                                st.subheader("Successfully Processed Attachments")
+                                for att in [a for a in attachments if a.get("status") == "success"]:
+                                    with st.expander(f"{att.get('filename', 'Unknown')}"):
+                                        st.write(f"**Filename:** {att.get('filename', 'Unknown')}")
+                                        st.write(f"**MIME Type:** {att.get('mime_type', 'Unknown')}")
+                                        if 'web_link' in att:
+                                            st.write(f"**Drive Link:** [Open in Drive]({att['web_link']})")
+                        else:
+                            st.info("No attachments processed")
+                    else:
+                        st.info("No attachment results available")
                 
-                # Add to chat history
-                st.session_state.chat_history.append({"role": "assistant", "content": response_text})
+                # Raw Result tab
+                with tabs[3]:
+                    st.subheader("Raw Result")
+                    st.json(result)
             else:
-                # Error case
-                error_text = f"Error: {result.get('error', 'Unknown error')}"
-                response_placeholder.error(error_text)
-                st.session_state.chat_history.append({"role": "assistant", "content": error_text})
-    else:
-        st.info("Processing your request... Please wait.")
-
-else:
-    st.warning("Services not initialized. Please check the logs and try reloading the page.")
+                st.error(f"Error: {result.get('error', 'Unknown error')}")
+    
+    # Show sample queries
+    with st.expander("Sample Queries"):
+        st.write("Click on any sample query to use it:")
+        sample_queries = [
+            "Find all emails with attachments from eman.abou_arab@bell.ca in 2025",
+            "Download attachments from emails sent by john.doe@example.com",
+            "Summarize all attachments from david.smith@example.com about project updates",
+            "Analyze content from spreadsheets in emails from finance@example.com"
+        ]
+        
+        for sample in sample_queries:
+            if st.button(sample):
+                st.session_state.user_query = sample
+                st.experimental_rerun()
 
 # Display logs in sidebar
 log_container.text_area(
@@ -530,3 +428,62 @@ def on_exit():
 
 import atexit
 atexit.register(on_exit)
+
+# Define functions to initialize services
+def initialize_supabase():
+    """Initialize Supabase client."""
+    supabase_url = os.getenv('SUPABASE_URL')
+    supabase_key = os.getenv('SUPABASE_KEY')
+    
+    if not supabase_url or not supabase_key:
+        logger.error("SUPABASE_URL or SUPABASE_KEY is missing in .env")
+        return None
+    
+    try:
+        # Create synchronous Supabase client
+        logger.info(f"Creating Supabase client with URL starting with: {supabase_url[:10]}...")
+        supabase = create_client(supabase_url, supabase_key)
+        # Validate connection by making a simple query
+        result = supabase.table('processed_items').select('id').limit(1).execute()
+        logger.info("Supabase connection validated successfully")
+        return supabase
+    except Exception as e:
+        logger.error(f"Supabase connection failed: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return None
+
+def initialize_archon():
+    """Initialize Archon MCP client using httpx."""
+    try:
+        archon_url = os.getenv('ARCHON_MCP_URL', 'http://host.docker.internal:8100')
+        logger.info(f'Initializing Archon MCP client with URL: {archon_url}')
+        return httpx.Client(base_url=archon_url, timeout=30.0)
+    except Exception as e:
+        logger.error(f"Failed to initialize Archon MCP client: {str(e)}")
+        logger.error(traceback.format_exc())
+        return None
+
+# Make sure TechevoRagAgent has a synchronous run_workflow method
+def patch_agent_if_needed():
+    """Add a synchronous wrapper method to TechevoRagAgent if it doesn't already have one."""
+    if not hasattr(TechevoRagAgent, 'run_workflow_sync'):
+        # Add a synchronous wrapper method
+        def run_workflow_sync(self, query, deps):
+            """Synchronous wrapper for run_workflow."""
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(self.run_workflow(query, deps))
+                loop.close()
+                return result
+            except Exception as e:
+                logger.error(f"Error in synchronous wrapper: {str(e)}")
+                logger.error(traceback.format_exc())
+                return {"status": "error", "error": str(e)}
+        
+        # Add the method to the class
+        TechevoRagAgent.run_workflow_sync = run_workflow_sync
+        logger.info("Added synchronous wrapper method to TechevoRagAgent")
+
+# Apply the patch when the module is loaded
+patch_agent_if_needed()
