@@ -13,13 +13,11 @@ from typing import Dict, Any, List, Optional
 import logging
 import time
 import traceback
-from collections import defaultdict
 
 import streamlit as st
 from dotenv import load_dotenv
 import logfire
 
-# Import agent components
 from agent import (
     primary_agent, 
     EnhancedDeps, 
@@ -29,17 +27,19 @@ from agent import (
     validate_env_vars
 )
 
-# Import Supabase client
 from supabase import create_client
 
-# Configure logging
-logfire.configure()
+logfire.configure(
+    app_name="techevo-rag",
+    level="INFO",
+    capture_stdout=True,
+    capture_stderr=True
+)
+
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
 
-# Initialize session state
 if 'initialized' not in st.session_state:
     st.session_state.initialized = False
     st.session_state.gmail_service = None
@@ -128,15 +128,6 @@ async def initialize_services():
         st.error(error_msg)
         return None, None, None, None, None, None
 
-# Sync wrapper for the async initialization
-def sync_initialize_services():
-    """Synchronous wrapper for initialization."""
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        return loop.run_until_complete(initialize_services())
-    else:
-        return asyncio.run(initialize_services())
-
 # Async function to run the agent
 async def run_agent_async(query: str, deps: EnhancedDeps):
     """Run the agent with the given query."""
@@ -209,37 +200,23 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Manual refresh button rather than auto-refresh
-if 'last_refresh' not in st.session_state:
-    st.session_state.last_refresh = time.time()
-
-# App title and description
 st.title("📊 Techevo-RAG Chat Interface")
 st.markdown("""
-This system allows you to interact with AI agents for email searching, attachment downloading, 
-Google Drive searching, and RAG processing. Enter a request below to get started.
-
-**Example requests:**
-- "Search for emails about marketing campaigns"
-- "Download attachments from finance emails"
-- "Summarize all information about quarterly reports"
+This system allows you to interact with AI agents for email searching, attachment downloading, Google Drive searching, and RAG processing.
+Enter a request below to get started (e.g., "find all emails with attachments from eman.abou_arab@bell.ca", "process campaign emails", "summarize quarterly reports").
+If a request cannot be handled by existing agents, a new sub-agent will be created dynamically via the Archon MCP server.
 """)
 
-# Sidebar
 st.sidebar.title("📝 System Status")
 status_container = st.sidebar.container()
-
-# Refresh button for logs and status
-if st.sidebar.button("🔄 Refresh Status"):
-    st.session_state.last_refresh = time.time()
-    add_log("Status refreshed manually")
-
-# Log container in sidebar
 log_container = st.sidebar.container()
 
-# Initialize services on first run
+# Initialize services asynchronously within Streamlit's main loop
 if not st.session_state.initialized:
     with st.spinner("Initializing services..."):
+        # Use asyncio.ensure_future to schedule the coroutine
+        loop = asyncio.get_event_loop()
+        future = asyncio.ensure_future(initialize_services())
         (
             st.session_state.gmail_service,
             st.session_state.drive_service,
@@ -247,18 +224,16 @@ if not st.session_state.initialized:
             st.session_state.supabase,
             st.session_state.archon_client,
             st.session_state.deps
-        ) = sync_initialize_services()
-        
+        ) = loop.run_until_complete(future)
         if st.session_state.deps is not None:
             st.session_state.initialized = True
             add_log("Services initialized successfully")
-            status_container.success("✅ All services initialized")
+            status_container.success("✅ All services connected")
         else:
             st.error("Failed to initialize services. Check logs for details.")
             add_log("Failed to initialize services")
             status_container.error("❌ Service initialization failed")
 
-# Show services status
 if st.session_state.initialized:
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -298,7 +273,7 @@ if st.session_state.initialized:
 
     # Chat input
     if not st.session_state.processing:
-        user_input = st.chat_input("Enter your request (e.g., 'process campaign emails')")
+        user_input = st.chat_input("Enter your request (e.g., 'find all emails with attachments from eman.abou_arab@bell.ca')")
         if user_input:
             # Add user message to chat
             with st.chat_message("user"):
@@ -316,7 +291,7 @@ if st.session_state.initialized:
                     response_placeholder = st.empty()
                     response_placeholder.markdown("_Processing your request..._")
                 
-                # Run the agent
+                # Run the agent with proper async handling
                 result = sync_run_agent(user_input, st.session_state.deps)
                 st.session_state.results = result
                 
@@ -389,8 +364,8 @@ if st.session_state.initialized:
                         response_text += f"**Analysis Error:** {rag_result.get('error', 'Unknown error processing your request')}\n"
                 
                 # Include execution time if available
-                if 'execution_time' in result:
-                    response_text += f"\n_Request processed in {result.get('execution_time')}_"
+                if 'runtime' in result:
+                    response_text += f"\n_Request processed in {result.get('runtime'):.2f} seconds_"
                 
                 # Update the placeholder with the final response
                 response_placeholder.markdown(response_text)
@@ -413,11 +388,17 @@ log_container.text_area(
     "System Logs",
     value="\n".join(st.session_state.logs[-50:]),  # Show only last 50 logs
     height=400,
-    key=f"logs_{st.session_state.last_refresh}",  # Force refresh when button is clicked
     disabled=True
 )
 
-# Footer
+try:
+    recent_logs = logfire.get_recent_logs(max_entries=50)
+    if recent_logs:
+        with log_container.expander("Detailed Logs"):
+            st.code(recent_logs)
+except Exception:
+    pass
+
 st.markdown("---")
 st.markdown("""
 **Instructions:** Run with `streamlit run streamlit_app.py --server.port 8502`
@@ -425,7 +406,6 @@ st.markdown("""
 **GitHub:** [Techevo-RAG](https://github.com/TimothiousAI/Techevo-RAG) | **Version:** 1.0.0
 """)
 
-# Cleanup on app exit
 def on_exit():
     """Close connections and perform cleanup when app exits."""
     if st.session_state.initialized and hasattr(st.session_state, 'archon_client') and st.session_state.archon_client is not None:
@@ -434,4 +414,4 @@ def on_exit():
     logfire.info("Application shutting down")
 
 import atexit
-atexit.register(on_exit) 
+atexit.register(on_exit)
