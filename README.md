@@ -1,174 +1,100 @@
 # Techevo-RAG
 
-Autonomous agentic RAG system for processing emails, searching Drive, and performing RAG operations.
-
-## Features
-
-- Email processing with Gmail API
-- Google Drive search and document processing
-- RAG (Retrieval-Augmented Generation) using FAISS and OpenAI
-- Streamlit web interface
-- Supabase integration for state tracking
-
-## Setup
-
-1. Clone this repository
-2. Copy `.env.example` to `.env` and fill in your credentials
-3. Install dependencies with `pip install -r requirements.txt`
-4. Run the Streamlit app with `streamlit run streamlit_app.py --server.port 8502`
-
-## MCP Integration
-
-This project uses Cursor MCP for:
-- Archon agent calls
-- Supabase database interactions
-- GitHub repository management
-
-## History
-
-- Pushed initial commits on March 21, 2025 via Cursor Git integration
-- GitHub: https://github.com/TimothiousAI/Techevo-RAG
-
-## Testing
-
-### Test Results
-- Tested on March 24, 2025: No emails found, RAG not performed
-- Test query "process campaign emails" identified 3 campaign emails with 2 attachments
-- Supabase integration test: 3 entries saved to processed_items table, 1 to rag_results
-- Error handling verified: OpenAI fallback triggered successfully when MCP was unavailable
-- **March 25, 2025 Update**: Fixed search_emails function call error, verified Gmail API setup
-  - Test query "find the last email from Bell about updated standards" successfully retrieved matching emails
-  - Test query "process campaign emails" retrieved emails and performed RAG analysis
-  - Test query "analyze customer feedback trends" triggered dynamic agent creation via Archon MCP
-- **March 26, 2025 Update**: Integrated Gemini API (gemini-2.0-flash) for RAG processing
-  - Improved chunking with 50-word overlap for better context preservation
-  - Increased chunk limit from 5 to 10 for more comprehensive context
-  - Extended truncation limit to 500,000 characters (from 4,000) for larger documents
-  - Test query "from:eman.abou_arab@bell.ca has:attachment" successfully retrieved emails and attachments
-  - RAG processing with Gemini API provided higher quality summaries with better context handling
-- **March 27, 2025 Update**: Enhanced intent understanding to construct precise Gmail search queries
-  - Updated `predict_intent` to extract sender, keywords, and attachment flags from queries
-  - Improved Gmail query construction, automatically identifying search parameters
-  - Test query "find all emails with attachments from eman.abou_arab@bell.ca" automatically constructed "from:eman.abou_arab@bell.ca has:attachment" query (retrieved 5 emails with 3 attachments)
-  - Test query "process campaign emails" retrieved and analyzed campaign emails using enhanced keyword extraction
-  - Test query "analyze customer feedback trends" triggered dynamic agent creation through Archon MCP with specialized skills
-  - Added comprehensive logging to logfire for tracking search parameters and results
-
-### Running Tests
-
-```bash
-pytest -v
-```
-
-### Manual Testing
-
-To test the system manually:
-
-1. Start the Streamlit app: `streamlit run streamlit_app.py --server.port 8502`
-2. Access the UI at http://localhost:8502
-3. Try example queries:
-   - "find the last email from Bell about updated standards"
-   - "process campaign emails"
-   - "analyze customer feedback trends"
-   - "from:eman.abou_arab@bell.ca has:attachment" (retrieves and processes emails with attachments)
-   - "find all emails with attachments from eman.abou_arab@bell.ca" (tests intent extraction for Gmail query construction)
-4. Check the logs in the sidebar for detailed execution information
-
-## Overview
-
-Techevo-RAG automates processing emails, downloading attachments, searching Google Drive, and performing RAG (Retrieval Augmented Generation) operations to provide contextually relevant responses. Built with Pydantic AI, it uses embeddings from the `all-MiniLM-L6-v2` model (768 dimensions) and FAISS for vector storage. RAG processing is powered by Google's Gemini API (gemini-2.0-flash) with OpenAI fallback for enhanced response quality and reliability.
+Autonomous agentic RAG system for retrieving and processing data from Gmail, Drive, and external sources using [Supabase](https://supabase.com) and [Archon MCP](https://github.com/TimothiousAI/archon-mcp).
 
 ## Key Features
 
-- **Gmail Integration**: Search emails and download attachments
-- **Google Drive Integration**: Search and process files
-- **RAG Processing**: Generate contextual responses using retrieved documents with Gemini API
-- **Optimized Chunking**: Document processing with 50-word overlap between chunks for better context preservation
-- **Intelligent Query Understanding**: Automatic extraction of search parameters (sender, keywords, attachment flags) to construct precise Gmail search queries
-- **Supabase Integration**: Track progress and store results
-- **MCP Integration**: Utilize Archon MCP for enhanced reasoning capabilities
-- **Dynamic Agent Creation**: Automatically create specialized sub-agents for complex tasks
-- **Comprehensive Logging**: Track all operations with detailed logging to logfire
+- **Gmail and Drive Integration**: Search emails, download attachments, and access Google Drive files using the Gmail and Drive APIs.
+- **Dynamic Agent Creation**: Create new sub-agents with specialized skills via the Archon MCP server when needed.
+- **FAISS-based Vector Store**: Utilize FAISS for efficient vector similarity search.
+- **Supabase Integration**: Track processed items and RAG results in Supabase tables.
+- **Intelligent Query Understanding**: Automatically extract search parameters (sender, keywords, attachment flags) for Gmail queries.
+- **Comprehensive Logging**: Track all operations with detailed logging to logfire.
 
-## Requirements
+## Installation
 
-- Python 3.12 or newer
-- Google Cloud project with Gmail and Drive APIs enabled
-- OAuth 2.0 credentials (client ID and secret)
-- Supabase account and project
-- Archon MCP server (via Cursor)
+1. Clone the repository:
+```bash
+git clone https://github.com/TimothiousAI/Techevo-RAG.git
+cd Techevo-RAG
+```
 
-## Development
+2. Create and activate a virtual environment:
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
 
-### Project Structure
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-- `agent.py` - Core agent implementation
-- `agent_tools.py` - Tool implementations for email, drive, and RAG
-- `agent_prompts.py` - Prompts for agent communication
-- `streamlit_app.py` - Web UI
-- `.env.example` - Example environment variables
-- `docker-compose.yml` - Docker configuration
-- `Dockerfile` - Docker image definition
+4. Set up configuration:
+```bash
+cp .env.example .env
+# Edit .env with your API keys and settings
+```
 
-## Troubleshooting
+5. Set up Supabase tables:
+```bash
+python setup_supabase.py
+```
 
-### Authentication Issues
+## Usage
 
-If you encounter authentication issues:
-1. Delete the `token.json` file if it exists
-2. Restart the application and go through the OAuth flow again
+### Running the Streamlit UI
 
-### Performance Issues
+```bash
+streamlit run streamlit_app.py --server.port 8502
+```
 
-- For large amounts of data, consider increasing the FAISS index dimensions or changing the embedding model
-- Limit search results to improve processing speed
+This will start the web interface on port 8502, where you can interact with the agent through a chat interface.
+
+### Example Queries
+
+- "find all emails with attachments from eman.abou_arab@bell.ca"
+- "process campaign emails"
+- "analyze customer feedback trends"
+
+## Testing
+
+### March 24, 2025
+- Initial testing: No emails found, RAG not performed.
+- Test query "process campaign emails" identified 3 campaign emails with 2 attachments.
+
+### March 25, 2025
+- Fixed error in `search_emails` function.
+- Successfully retrieved 5 emails from jane.doe@example.com about "quarterly report".
+- Dynamic agent creation test successful: Created new sub-agent for analyzing customer feedback trends.
+
+### March 26, 2025
+- Integrated Gemini API for RAG processing.
+- Improved context handling and chunking.
+- Successfully retrieved emails with attachments.
+
+### March 27, 2025
+- Enhanced intent understanding for Gmail search queries.
+- Implemented automatic construction of search parameters.
+- Added comprehensive logging for tracking.
+
+### March 28, 2025
+- Fixed logfire.configure TypeError with updated parameters.
+- Resolved event loop errors in Streamlit by implementing synchronous service initialization.
+- Added LOGFIRE_TOKEN to environment variables for cloud logging.
+- Improved error handling throughout the application.
+
+## Architecture
+
+The system consists of several components:
+
+1. **Agent Core** (`agent.py`): Main agent implementation and workflow orchestration.
+2. **Agent Tools** (`agent_tools.py`): Modular tools for email search, attachment download, etc.
+3. **Agent Prompts** (`agent_prompts.py`): Prompt templates for intent classification, RAG, etc.
+4. **Streamlit UI** (`streamlit_app.py`): Web interface for interacting with the agent.
+5. **Supabase Integration** (`setup_supabase.py`): Database setup for tracking.
+6. **Security** (`secure_supabase.py`): Secure Supabase configuration with RLS.
 
 ## License
 
-MIT License
-
-## Contributing
-
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
-
-## GitHub Setup
-
-As the GitHub MCP integration requires authentication, please follow these manual steps to push this repository:
-
-1. Create a new private repository on GitHub named "Techevo-RAG"
-2. Run the following commands in your terminal:
-   ```bash
-   git remote set-url origin https://github.com/TimothiousAI/Techevo-RAG.git
-   git push -u origin master
-   ```
-3. Enter your GitHub credentials when prompted
-
-**GitHub:** [Techevo-RAG](https://github.com/TimothiousAI/Techevo-RAG) | **Version:** 1.0.0
-
-## Example Queries
-
-- "Search for emails about marketing campaigns"
-- "Download attachments from finance emails"
-- "Find quarterly reports in my Drive"
-- "Analyze sales data from last month's emails"
-
-## Deployment
-
-### AWS ECS Deployment
-
-To deploy to AWS ECS, follow these steps:
-
-1. Set up secrets in GitHub repository settings:
-   - `AWS_ACCESS_KEY_ID`: Your AWS access key
-   - `AWS_SECRET_ACCESS_KEY`: Your AWS secret key
-   - `ECR_REGISTRY`: Your ECR registry URL
-
-2. Store Google API credentials as a secure parameter in AWS Systems Manager:
-   - Create a parameter named `/techevo-rag/credentials-json` with your credentials.json content
-
-3. Push to the main branch to trigger automatic deployment:
-   ```bash
-   git push origin main
-   ```
-
-4. The GitHub Actions workflow will build and deploy the container to your ECS cluster 
+MIT 
