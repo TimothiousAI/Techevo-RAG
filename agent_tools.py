@@ -20,6 +20,7 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 import httpx
+from googleapiclient.http import MediaIoBaseUpload
 
 from agent_prompts import (
     RAG_PROMPT, 
@@ -175,132 +176,95 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict]:
         ctx.log.error(f"Traceback: {traceback.format_exc()}")
         return []  # Return empty list instead of raising to continue with workflow
 
-async def download_attachment(ctx: AgentContext, query: str) -> List[Dict]:
+async def download_attachment(ctx: AgentContext, email_id: str, attachment_id: str, folder_id: str) -> Dict:
     """
-    Download attachments from emails matching the query.
+    Download an email attachment and upload it to Google Drive.
     
     Args:
-        ctx: Agent context containing deps and logger
-        query: The user query
+        ctx: Agent context with dependencies
+        email_id: Gmail message ID
+        attachment_id: Attachment ID within the email
+        folder_id: Google Drive folder ID to upload to
         
     Returns:
-        List of downloaded attachments
+        Dict with download/upload status and metadata
     """
     gmail_service = ctx.deps.gmail_service
     drive_service = ctx.deps.drive_service
-    
-    if not gmail_service or not drive_service:
-        ctx.log.error("Gmail or Drive service not initialized")
-        raise ValueError("Gmail or Drive service not initialized")
-    
-    # First, search for emails if not already in state
-    if not hasattr(ctx.deps, 'state') or 'processed_emails' not in ctx.deps.state or not ctx.deps.state['processed_emails']:
-        ctx.log.info("No emails in state, searching first")
-        await search_emails(ctx, query)
-    
-    if not hasattr(ctx.deps, 'state') or 'processed_emails' not in ctx.deps.state or not ctx.deps.state['processed_emails']:
-        ctx.log.error("No emails found to download attachments from")
-        return []
-    
-    # Create attachments directory if it doesn't exist
-    os.makedirs('attachments', exist_ok=True)
-    
-    # Find the default Drive folder ID, create one if not exists
-    folder_id = os.getenv('DEFAULT_DRIVE_FOLDER_ID')
-    if not folder_id:
-        folder_metadata = {
-            'name': 'TechevoRAG_Attachments',
-            'mimeType': 'application/vnd.google-apps.folder'
-        }
-        folder = drive_service.files().create(
-            body=folder_metadata,
-            fields='id'
-        ).execute()
-        folder_id = folder.get('id')
-        ctx.log.info(f"Created new Drive folder with ID: {folder_id}")
-    
-    # Process attachments
-    downloaded = []
-    cache = load_cache()
+    filename = 'unknown'  # Default in case we can't get the real filename
     
     try:
-        for email in ctx.deps.state['processed_emails']:
-            if not email.get('attachments'):
-                continue
-                
-            for attachment in email['attachments']:
-                try:
-                    ctx.log.info(f"Downloading attachment: {attachment['filename']} from email {email['id']}")
-                    
-                    # Download the attachment
-                    attachment_data = gmail_service.users().messages().attachments().get(
-                        userId='me',
-                        messageId=email['id'],
-                        id=attachment['id']
-                    ).execute()
-                    
-                    file_data = base64.urlsafe_b64decode(attachment_data['data'])
-                    
-                    # Save locally
-                    local_path = os.path.join('attachments', attachment['filename'])
-                    with open(local_path, 'wb') as f:
-                        f.write(file_data)
-                    
-                    # Upload to Drive
-                    file_metadata = {
-                        'name': attachment['filename'],
-                        'parents': [folder_id]
-                    }
-                    
-                    media = io.BytesIO(file_data)
-                    uploaded_file = drive_service.files().create(
-                        body=file_metadata,
-                        media_body=media,
-                        fields='id,name,webViewLink'
-                    ).execute()
-                    
-                    result = {
-                        'email_id': email['id'],
-                        'attachment_id': attachment['id'],
-                        'filename': attachment['filename'],
-                        'local_path': local_path,
-                        'drive_id': uploaded_file['id'],
-                        'drive_link': uploaded_file['webViewLink']
-                    }
-                    
-                    downloaded.append(result)
-                    
-                    # Store content in state for RAG
-                    if 'attachments_content' not in cache:
-                        cache['attachments_content'] = {}
-                    
-                    # Store content as base64 string in the cache
-                    cache['attachments_content'][attachment['filename']] = base64.b64encode(file_data).decode('utf-8')
-                    
-                    if hasattr(ctx.deps, 'state'):
-                        if 'attachments_content' not in ctx.deps.state:
-                            ctx.deps.state['attachments_content'] = {}
-                        ctx.deps.state['attachments_content'][attachment['filename']] = file_data
-                    
-                except Exception as e:
-                    ctx.log.error(f"Error downloading attachment {attachment['filename']}: {e}")
-                    ctx.log.error(f"Traceback: {traceback.format_exc()}")
-                    downloaded.append({
-                        'error': str(e),
-                        'filename': attachment['filename'],
-                        'email_id': email['id']
-                    })
+        # Get the email message to find attachment metadata
+        message = gmail_service.users().messages().get(
+            userId='me',
+            id=email_id,
+            format='full'
+        ).execute()
         
-        # Save cache
-        save_cache(cache)
+        # Find the attachment part and filename
+        parts = message.get('payload', {}).get('parts', [])
+        for part in parts:
+            if part.get('body', {}).get('attachmentId') == attachment_id:
+                filename = part.get('filename', 'unknown')
+                mime_type = part.get('mimeType', 'application/octet-stream')
+                break
         
-        ctx.log.info(f"Downloaded {len(downloaded)} attachments")
-        return downloaded
-    
+        ctx.log.info(f'Downloading attachment: {filename} from email {email_id}')
+        
+        # Download attachment data
+        attachment_data = gmail_service.users().messages().attachments().get(
+            userId='me',
+            messageId=email_id,
+            id=attachment_id
+        ).execute()
+        
+        if not attachment_data or 'data' not in attachment_data:
+            raise ValueError('No attachment data found')
+            
+        # Decode attachment data
+        file_data = io.BytesIO(base64.urlsafe_b64decode(attachment_data['data']))
+        
+        # Create Drive upload media
+        media = MediaIoBaseUpload(
+            file_data,
+            mimetype=mime_type,
+            resumable=True  # Enable resumable uploads for large files
+        )
+        
+        # Prepare file metadata
+        file_metadata = {
+            'name': filename,
+            'parents': [folder_id] if folder_id else None
+        }
+        
+        ctx.log.info(f'Uploading {filename} to Drive folder {folder_id}')
+        
+        # Create the file in Drive
+        uploaded_file = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id,name,mimeType,webViewLink'  # Request additional metadata
+        ).execute()
+        
+        ctx.log.info(f'Successfully uploaded {filename} to Drive with ID: {uploaded_file["id"]}')
+        
+        return {
+            'filename': filename,
+            'drive_id': uploaded_file['id'],
+            'mime_type': uploaded_file.get('mimeType'),
+            'web_link': uploaded_file.get('webViewLink'),
+            'status': 'success'
+        }
+        
     except Exception as e:
-        ctx.log.error(f"Error in download_attachment: {e}")
-        ctx.log.error(f"Traceback: {traceback.format_exc()}")
-        raise
+        error_msg = f'Error downloading/uploading attachment {filename}: {str(e)}'
+        ctx.log.error(error_msg)
+        ctx.log.error(f'Traceback: {traceback.format_exc()}')
+        return {
+            'filename': filename,
+            'status': 'error',
+            'error': str(e)
+        }
 
 async def search_drive(ctx: AgentContext, query: str) -> List[Dict]:
     """

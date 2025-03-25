@@ -692,37 +692,75 @@ class TechevoRagAgent:
                     
                     elif tool == 'download_attachment':
                         attachment_results = []
+                        downloaded_ids = set()  # Track downloaded attachment IDs
                         
                         # Try to find emails if not already in state
                         if not deps.state.get('processed_emails'):
                             logger.info("No emails in state, running search_emails first")
                             if 'search_emails' in self.available_tools:
                                 try:
-                                    # Use raw query directly
-                                    emails = await self.available_tools['search_emails'](ctx, query)
+                                    # Use the constructed Gmail query
+                                    emails = await self.available_tools['search_emails'](ctx, gmail_query)
                                     deps.state['processed_emails'] = emails
                                 except Exception as e:
                                     logger.error(f"Error searching emails before download: {str(e)}")
+                                    logger.error(traceback.format_exc())
                             else:
                                 logger.warning("Cannot search emails: tool not available")
                         
                         if deps.state.get('processed_emails'):
+                            # Get default Drive folder ID
+                            folder_id = os.getenv('DEFAULT_DRIVE_FOLDER_ID')
+                            if not folder_id:
+                                try:
+                                    # Create default folder if it doesn't exist
+                                    folder_metadata = {
+                                        'name': 'TechevoRAG_Attachments',
+                                        'mimeType': 'application/vnd.google-apps.folder'
+                                    }
+                                    folder = deps.drive_service.files().create(
+                                        body=folder_metadata,
+                                        fields='id'
+                                    ).execute()
+                                    folder_id = folder.get('id')
+                                    logger.info(f"Created new Drive folder with ID: {folder_id}")
+                                except Exception as e:
+                                    logger.error(f"Error creating Drive folder: {str(e)}")
+                                    logger.error(traceback.format_exc())
+                                    continue
+                            
+                            # Process each email's attachments
                             for email in deps.state['processed_emails']:
                                 if email.get('attachments'):
                                     for attachment in email.get('attachments', []):
-                                        logger.info(f"Downloading attachment {attachment.get('filename', 'unknown')} from email {email.get('id', 'unknown')}")
-                                        try:
-                                            # Update to use the context based method signature with raw query
-                                            download_result = await tool_func(ctx, query)
-                                            attachment_results.append(download_result)
-                                        except Exception as e:
-                                            logger.error(f"Error downloading attachment: {str(e)}")
-                                            attachment_results.append({
-                                                "status": "error", 
-                                                "error": str(e), 
-                                                "email_id": email.get('id', 'unknown'),
-                                                "attachment": attachment.get('filename', 'unknown')
-                                            })
+                                        attachment_id = attachment.get('id')
+                                        if attachment_id and attachment_id not in downloaded_ids:
+                                            try:
+                                                # Download and upload attachment
+                                                download_result = await tool_func(
+                                                    ctx,
+                                                    email_id=email['id'],
+                                                    attachment_id=attachment_id,
+                                                    folder_id=folder_id
+                                                )
+                                                
+                                                if download_result['status'] == 'success':
+                                                    downloaded_ids.add(attachment_id)
+                                                    attachment_results.append(download_result)
+                                                    logger.info(f"Successfully processed attachment: {download_result['filename']}")
+                                                else:
+                                                    logger.warning(f"Failed to process attachment: {download_result.get('error', 'Unknown error')}")
+                                                    attachment_results.append(download_result)
+                                                    # Don't break here, try other attachments
+                                            except Exception as e:
+                                                logger.error(f"Error processing attachment: {str(e)}")
+                                                logger.error(traceback.format_exc())
+                                                attachment_results.append({
+                                                    'status': 'error',
+                                                    'error': str(e),
+                                                    'email_id': email['id'],
+                                                    'attachment_id': attachment_id
+                                                })
                             
                             result['data']['attachments'] = attachment_results
                             deps.state['downloaded_attachments'] = attachment_results
@@ -731,7 +769,7 @@ class TechevoRagAgent:
                             logfire.info("Attachment download results",
                                 query=query,
                                 attachment_count=len(attachment_results),
-                                success_count=sum(1 for a in attachment_results if a.get('status') != 'error'),
+                                success_count=sum(1 for a in attachment_results if a.get('status') == 'success'),
                                 error_count=sum(1 for a in attachment_results if a.get('status') == 'error')
                             )
                         else:
