@@ -748,21 +748,21 @@ class TechevoRagAgent:
                             # Log the result details
                             email_count = len(emails) if emails else 0
                             attachment_count = sum(len(email.get('attachments', [])) for email in emails) if emails else 0
-                            logfire.info("Email search results", {
-                                'query': query,
-                                'gmail_query': gmail_query,
-                                'email_count': email_count,
-                                'attachment_count': attachment_count,
-                                'has_emails': email_count > 0
-                            })
+                            logfire.info("Email search results",
+                                query=query,
+                                gmail_query=gmail_query,
+                                email_count=email_count,
+                                attachment_count=attachment_count,
+                                has_emails=email_count > 0
+                            )
                         except Exception as e:
                             logger.error(f"Error searching emails: {str(e)}")
-                            logfire.error("Email search error", {
-                                'query': query, 
-                                'gmail_query': gmail_query,
-                                'error': str(e),
-                                'traceback': traceback.format_exc()
-                            })
+                            logfire.error("Email search error",
+                                query=query, 
+                                gmail_query=gmail_query,
+                                error=str(e),
+                                traceback=traceback.format_exc()
+                            )
                             result['data']['emails'] = {"status": "error", "error": str(e)}
                     
                     elif tool == 'download_attachment':
@@ -803,13 +803,13 @@ class TechevoRagAgent:
                             deps.state['downloaded_attachments'] = attachment_results
                             
                             # Log attachment download results
-                            logfire.info("Attachment download results", {
-                                'query': query,
-                                'gmail_query': gmail_query,
-                                'attachment_count': len(attachment_results),
-                                'success_count': sum(1 for a in attachment_results if a.get('status') != 'error'),
-                                'error_count': sum(1 for a in attachment_results if a.get('status') == 'error')
-                            })
+                            logfire.info("Attachment download results",
+                                query=query,
+                                gmail_query=gmail_query,
+                                attachment_count=len(attachment_results),
+                                success_count=sum(1 for a in attachment_results if a.get('status') != 'error'),
+                                error_count=sum(1 for a in attachment_results if a.get('status') == 'error')
+                            )
                         else:
                             logger.warning("No emails with attachments found")
                             result['data']['attachments'] = []
@@ -821,11 +821,11 @@ class TechevoRagAgent:
                             deps.state['drive_files'] = drive_files
                             
                             # Log drive search results
-                            logfire.info("Drive search results", {
-                                'query': query,
-                                'file_count': len(drive_files) if drive_files else 0,
-                                'has_files': len(drive_files) > 0 if drive_files else False
-                            })
+                            logfire.info("Drive search results",
+                                query=query,
+                                file_count=len(drive_files) if drive_files else 0,
+                                has_files=len(drive_files) > 0 if drive_files else False
+                            )
                         except Exception as e:
                             logger.error(f"Error searching Drive: {str(e)}")
                             result['data']['drive_files'] = {"status": "error", "error": str(e)}
@@ -865,14 +865,14 @@ class TechevoRagAgent:
                                 deps.state['rag_results'] = rag_result
                                 
                                 # Log RAG results
-                                logfire.info("RAG results", {
-                                    'query': query,
-                                    'document_count': len(documents),
-                                    'chunks_used': len(rag_result.get('chunks_used', [])),
-                                    'status': rag_result.get('status'),
-                                    'model': rag_result.get('model', 'gemini-2.0-flash'),
-                                    'response_length': len(rag_result.get('response', ''))
-                                })
+                                logfire.info("RAG results",
+                                    query=query,
+                                    document_count=len(documents),
+                                    chunks_used=len(rag_result.get('chunks_used', [])),
+                                    status=rag_result.get('status'),
+                                    model=rag_result.get('model', 'gemini-2.0-flash'),
+                                    response_length=len(rag_result.get('response', ''))
+                                )
                             except Exception as e:
                                 logger.error(f"Error performing RAG: {str(e)}")
                                 result['data']['rag_result'] = {
@@ -925,11 +925,11 @@ class TechevoRagAgent:
         except Exception as e:
             logger.error(f"Error running workflow: {str(e)}")
             logger.error(traceback.format_exc())
-            logfire.error("Workflow error", {
-                'query': query,
-                'error': str(e),
-                'traceback': traceback.format_exc()
-            })
+            logfire.error("Workflow error", 
+                query=query,
+                error=str(e),
+                traceback=traceback.format_exc()
+            )
             return {
                 'status': 'error',
                 'error': str(e),
