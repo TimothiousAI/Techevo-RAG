@@ -595,10 +595,20 @@ class TechevoRagAgent:
         """
         started_at = time.time()
         try:
+            # Check for required services first
+            if not deps.gmail_service:
+                logger.error("Gmail service not initialized")
+                return {
+                    'status': 'error',
+                    'error': 'Gmail service not available',
+                    'query': query,
+                    'runtime': time.time() - started_at
+                }
+            
             # Initialize state
             deps.state = {
                 'query': query,
-                'processed_emails': deps.state.get('processed_emails', []),
+                'processed_emails': [],
                 'downloaded_attachments': [],
                 'rag_results': [],
                 'start_time': started_at
@@ -739,9 +749,10 @@ class TechevoRagAgent:
                     
                     if tool == 'search_emails':
                         try:
-                            # Use the constructed Gmail query instead of the original query
+                            # Use the new search_emails with ctx and gmail_query
                             logger.info(f"Searching emails with query: {gmail_query}")
-                            emails = await tool_func(gmail_query, self.services, deps)
+                            # Pass context and query directly to the tool
+                            emails = await tool_func(ctx, gmail_query)
                             result['data']['emails'] = emails
                             deps.state['processed_emails'] = emails
                             
@@ -773,8 +784,8 @@ class TechevoRagAgent:
                             logger.info("No emails in state, running search_emails first")
                             if 'search_emails' in self.available_tools:
                                 try:
-                                    # Use the constructed Gmail query
-                                    emails = await self.available_tools['search_emails'](gmail_query, self.services, deps)
+                                    # Use the constructed Gmail query with the new method signature
+                                    emails = await self.available_tools['search_emails'](ctx, gmail_query)
                                     deps.state['processed_emails'] = emails
                                 except Exception as e:
                                     logger.error(f"Error searching emails before download: {str(e)}")
@@ -787,8 +798,8 @@ class TechevoRagAgent:
                                     for attachment in email.get('attachments', []):
                                         logger.info(f"Downloading attachment {attachment.get('filename', 'unknown')} from email {email.get('id', 'unknown')}")
                                         try:
-                                            # Use the existing download_attachment logic
-                                            download_result = await tool_func(query, self.services, deps)
+                                            # Update to use the context based method signature
+                                            download_result = await tool_func(ctx, gmail_query)
                                             attachment_results.append(download_result)
                                         except Exception as e:
                                             logger.error(f"Error downloading attachment: {str(e)}")
@@ -816,7 +827,7 @@ class TechevoRagAgent:
                     
                     elif tool == 'search_drive':
                         try:
-                            drive_files = await tool_func(query, self.services, deps)
+                            drive_files = await tool_func(ctx, query)
                             result['data']['drive_files'] = drive_files
                             deps.state['drive_files'] = drive_files
                             
@@ -893,7 +904,7 @@ class TechevoRagAgent:
                         # For any other tools
                         try:
                             # Generic tool call with properly ordered arguments
-                            tool_result = await tool_func(query, self.services, deps)
+                            tool_result = await tool_func(ctx, query)
                             result['data'][tool] = tool_result
                             deps.state[tool] = tool_result
                         except Exception as e:

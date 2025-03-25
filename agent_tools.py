@@ -75,42 +75,28 @@ def save_cache(data):
     except Exception as e:
         logger.error(f"Error saving cache: {e}")
 
-async def search_emails(query: str, services: Dict, deps) -> List[Dict]:
+async def search_emails(ctx: AgentContext, query: str) -> List[Dict]:
     """
     Search for emails matching the query in Gmail.
     
     Args:
+        ctx: Agent context containing deps and logger
         query: The user query
-        services: Dict containing initialized services
-        deps: Dependencies object with state
         
     Returns:
         List of emails with metadata
     """
-    gmail_service = services.get('gmail')
-    archon = services.get('archon')
+    ctx.log.info(f"Searching emails with query: {query}")
+    gmail_service = ctx.deps.gmail_service
+    archon = ctx.deps.archon_client
     
     if not gmail_service:
-        logger.error("Gmail service not initialized")
+        ctx.log.error("Gmail service not initialized")
         raise ValueError("Gmail service not initialized")
-    
-    # First check if we have cached results
-    cache = load_cache()
-    cache_key = f"email_{query.lower().strip()}"
-    
-    if cache_key in cache.get('email_searches', {}):
-        logger.info(f"Using cached email results for query: {query}")
-        emails = cache['email_searches'][cache_key]
-        
-        # Store in state
-        if hasattr(deps, 'state'):
-            deps.state['processed_emails'] = emails
-        
-        return emails
     
     # Use Archon to parse search parameters
     try:
-        logger.info(f"Refining email search criteria for: {query}")
+        ctx.log.info(f"Refining email search criteria for: {query}")
         search_prompt = EMAIL_SEARCH_PROMPT.format(query=query)
         
         search_response = await archon.generate(
@@ -119,27 +105,28 @@ async def search_emails(query: str, services: Dict, deps) -> List[Dict]:
         )
         
         if 'error' in search_response:
-            logger.error(f"Error getting search criteria: {search_response['error']}")
+            ctx.log.error(f"Error getting search criteria: {search_response['error']}")
             search_criteria = query
         else:
             search_criteria = search_response['response']
-            logger.info(f"Refined search criteria: {search_criteria}")
+            ctx.log.info(f"Refined search criteria: {search_criteria}")
     except Exception as e:
-        logger.error(f"Error generating search criteria: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        ctx.log.error(f"Error generating search criteria: {e}")
+        ctx.log.error(f"Traceback: {traceback.format_exc()}")
         search_criteria = query  # Fallback to original query
     
     try:
-        logger.info(f"Searching emails with criteria: {search_criteria}")
+        ctx.log.info(f"Performing live Gmail search with criteria: {search_criteria}")
         
         # Format 'full' retrieves the full email content
         results = gmail_service.users().messages().list(
             userId='me',
             q=search_criteria,
-            maxResults=10
+            maxResults=20  # Increased from 10 to ensure we get more results
         ).execute()
         
         messages = results.get('messages', [])
+        ctx.log.info(f"Found {len(messages)} potential messages")
         emails = []
         
         for message in messages:
@@ -190,50 +177,50 @@ async def search_emails(query: str, services: Dict, deps) -> List[Dict]:
                 'attachments': attachments
             }
             
+            # Only add emails with attachments if we're specifically searching for attachments
+            if 'attachment' in query.lower() and not attachments:
+                ctx.log.info(f"Skipping email {email_data['id']} without attachments since query mentions attachments")
+                continue
+                
             emails.append(email)
         
-        # Cache the results
-        cache['email_searches'][cache_key] = emails
-        save_cache(cache)
-        
         # Store in state
-        if hasattr(deps, 'state'):
-            deps.state['processed_emails'] = emails
+        if hasattr(ctx.deps, 'state'):
+            ctx.deps.state['processed_emails'] = emails
         
-        logger.info(f"Retrieved {len(emails)} matching emails")
+        ctx.log.info(f"Retrieved {len(emails)} matching emails (live search)")
         return emails
     
     except Exception as e:
-        logger.error(f"Error searching emails: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+        ctx.log.error(f"Error searching emails: {e}")
+        ctx.log.error(f"Traceback: {traceback.format_exc()}")
+        return []  # Return empty list instead of raising, to continue with workflow
 
-async def download_attachment(query: str, services: Dict, deps) -> List[Dict]:
+async def download_attachment(ctx: AgentContext, query: str) -> List[Dict]:
     """
     Download attachments from emails matching the query.
     
     Args:
+        ctx: Agent context containing deps and logger
         query: The user query
-        services: Dict containing initialized services
-        deps: Dependencies object with state
         
     Returns:
         List of downloaded attachments
     """
-    gmail_service = services.get('gmail')
-    drive_service = services.get('drive')
+    gmail_service = ctx.deps.gmail_service
+    drive_service = ctx.deps.drive_service
     
     if not gmail_service or not drive_service:
-        logger.error("Gmail or Drive service not initialized")
+        ctx.log.error("Gmail or Drive service not initialized")
         raise ValueError("Gmail or Drive service not initialized")
     
     # First, search for emails if not already in state
-    if not hasattr(deps, 'state') or 'processed_emails' not in deps.state or not deps.state['processed_emails']:
-        logger.info("No emails in state, searching first")
-        await search_emails(query, services, deps)
+    if not hasattr(ctx.deps, 'state') or 'processed_emails' not in ctx.deps.state or not ctx.deps.state['processed_emails']:
+        ctx.log.info("No emails in state, searching first")
+        await search_emails(ctx, query)
     
-    if not hasattr(deps, 'state') or 'processed_emails' not in deps.state:
-        logger.error("No emails found to download attachments from")
+    if not hasattr(ctx.deps, 'state') or 'processed_emails' not in ctx.deps.state or not ctx.deps.state['processed_emails']:
+        ctx.log.error("No emails found to download attachments from")
         return []
     
     # Create attachments directory if it doesn't exist
@@ -251,20 +238,20 @@ async def download_attachment(query: str, services: Dict, deps) -> List[Dict]:
             fields='id'
         ).execute()
         folder_id = folder.get('id')
-        logger.info(f"Created new Drive folder with ID: {folder_id}")
+        ctx.log.info(f"Created new Drive folder with ID: {folder_id}")
     
     # Process attachments
     downloaded = []
     cache = load_cache()
     
     try:
-        for email in deps.state['processed_emails']:
+        for email in ctx.deps.state['processed_emails']:
             if not email.get('attachments'):
                 continue
                 
             for attachment in email['attachments']:
                 try:
-                    logger.info(f"Downloading attachment: {attachment['filename']} from email {email['id']}")
+                    ctx.log.info(f"Downloading attachment: {attachment['filename']} from email {email['id']}")
                     
                     # Download the attachment
                     attachment_data = gmail_service.users().messages().attachments().get(
@@ -311,14 +298,14 @@ async def download_attachment(query: str, services: Dict, deps) -> List[Dict]:
                     # Store content as base64 string in the cache
                     cache['attachments_content'][attachment['filename']] = base64.b64encode(file_data).decode('utf-8')
                     
-                    if hasattr(deps, 'state'):
-                        if 'attachments_content' not in deps.state:
-                            deps.state['attachments_content'] = {}
-                        deps.state['attachments_content'][attachment['filename']] = file_data
+                    if hasattr(ctx.deps, 'state'):
+                        if 'attachments_content' not in ctx.deps.state:
+                            ctx.deps.state['attachments_content'] = {}
+                        ctx.deps.state['attachments_content'][attachment['filename']] = file_data
                     
                 except Exception as e:
-                    logger.error(f"Error downloading attachment {attachment['filename']}: {e}")
-                    logger.error(f"Traceback: {traceback.format_exc()}")
+                    ctx.log.error(f"Error downloading attachment {attachment['filename']}: {e}")
+                    ctx.log.error(f"Traceback: {traceback.format_exc()}")
                     downloaded.append({
                         'error': str(e),
                         'filename': attachment['filename'],
@@ -328,151 +315,86 @@ async def download_attachment(query: str, services: Dict, deps) -> List[Dict]:
         # Save cache
         save_cache(cache)
         
-        logger.info(f"Downloaded {len(downloaded)} attachments")
+        ctx.log.info(f"Downloaded {len(downloaded)} attachments")
         return downloaded
     
     except Exception as e:
-        logger.error(f"Error in download_attachment: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        ctx.log.error(f"Error in download_attachment: {e}")
+        ctx.log.error(f"Traceback: {traceback.format_exc()}")
         raise
 
-async def search_drive(query: str, services: Dict, deps) -> List[Dict]:
+async def search_drive(ctx: AgentContext, query: str) -> List[Dict]:
     """
     Search for files in Google Drive matching the query.
     
     Args:
+        ctx: Agent context containing deps and logger
         query: The user query
-        services: Dict containing initialized services
-        deps: Dependencies object with state
         
     Returns:
-        List of found files
+        List of files with metadata
     """
-    drive_service = services.get('drive')
-    archon = services.get('archon')
+    drive_service = ctx.deps.drive_service
     
     if not drive_service:
-        logger.error("Drive service not initialized")
+        ctx.log.error("Drive service not initialized")
         raise ValueError("Drive service not initialized")
     
-    # First check if we have cached results
-    cache = load_cache()
-    cache_key = f"drive_{query.lower().strip()}"
-    
-    if cache_key in cache.get('drive_searches', {}):
-        logger.info(f"Using cached Drive results for query: {query}")
-        files = cache['drive_searches'][cache_key]
-        
-        # Store in state
-        if hasattr(deps, 'state'):
-            deps.state['drive_files'] = files
-        
-        return files
-    
-    # Use Archon to parse search parameters
     try:
-        logger.info(f"Refining Drive search criteria for: {query}")
-        search_prompt = SEARCH_CRITERIA_PROMPT.format(query=query)
+        ctx.log.info(f"Searching Drive with query: {query}")
         
-        search_response = await archon.generate(
-            model="gpt-4o",
-            prompt=search_prompt
-        )
-        
-        if 'error' in search_response:
-            logger.error(f"Error getting search criteria: {search_response['error']}")
-            search_criteria = query
-        else:
-            search_criteria = search_response['response']
-            logger.info(f"Refined search criteria: {search_criteria}")
-    except Exception as e:
-        logger.error(f"Error generating search criteria: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        search_criteria = query  # Fallback to original query
-    
-    try:
-        logger.info(f"Searching Drive with criteria: {search_criteria}")
-        
-        # Search Drive for files
-        results = drive_service.files().list(
-            q=f"name contains '{search_criteria}' and trashed=false",
+        # Execute search request (no caching - always live)
+        search_results = drive_service.files().list(
+            q=f"fullText contains '{query}' and trashed = false",
             spaces='drive',
-            fields='files(id, name, mimeType, webViewLink, createdTime, modifiedTime)',
-            orderBy='modifiedTime desc',
-            pageSize=10
+            fields='files(id, name, mimeType, webViewLink, description)',
+            pageSize=20
         ).execute()
         
-        files = results.get('files', [])
+        files = search_results.get('files', [])
+        ctx.log.info(f"Found {len(files)} files in Drive")
         
-        # For text files, fetch the content for RAG
-        if 'drive_contents' not in cache:
-            cache['drive_contents'] = {}
-        
-        if hasattr(deps, 'state') and 'drive_contents' not in deps.state:
-            deps.state['drive_contents'] = {}
-        
+        results = []
         for file in files:
-            # Only process text files, PDFs, Google Docs etc.
-            if file['mimeType'] in [
-                'text/plain', 
-                'application/pdf',
-                'application/vnd.google-apps.document',
-                'application/vnd.google-apps.spreadsheet',
-                'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-            ]:
-                try:
-                    if file['mimeType'] == 'application/vnd.google-apps.document':
-                        # Export Google Docs as plain text
-                        content = drive_service.files().export(
-                            fileId=file['id'],
-                            mimeType='text/plain'
-                        ).execute()
-                        
-                        if isinstance(content, bytes):
-                            text_content = content.decode('utf-8')
-                        else:
-                            text_content = str(content)
-                    else:
-                        # Download other supported files
-                        request = drive_service.files().get_media(fileId=file['id'])
-                        file_content = io.BytesIO()
-                        downloader = request.execute()
-                        
-                        if isinstance(downloader, bytes):
-                            text_content = downloader.decode('utf-8', errors='ignore')
-                        else:
-                            text_content = str(downloader)
-                    
-                    # Cache the content
-                    cache['drive_contents'][file['id']] = text_content
-                    
-                    # Store in state
-                    if hasattr(deps, 'state'):
-                        deps.state['drive_contents'][file['id']] = text_content
-                        
-                    # Add content to the file metadata
-                    file['content'] = text_content[:1000] + "..." if len(text_content) > 1000 else text_content
-                    
-                except Exception as e:
-                    logger.error(f"Error fetching content for file {file['name']}: {e}")
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    file['content_error'] = str(e)
-        
-        # Cache the results
-        cache['drive_searches'][cache_key] = files
-        save_cache(cache)
-        
+            # Get more detailed metadata for each file
+            try:
+                file_metadata = drive_service.files().get(
+                    fileId=file['id'], 
+                    fields='id, name, mimeType, webViewLink, description, createdTime, modifiedTime, size, owners'
+                ).execute()
+                
+                results.append({
+                    'id': file_metadata.get('id', ''),
+                    'name': file_metadata.get('name', ''),
+                    'mimeType': file_metadata.get('mimeType', ''),
+                    'link': file_metadata.get('webViewLink', ''),
+                    'description': file_metadata.get('description', ''),
+                    'created': file_metadata.get('createdTime', ''),
+                    'modified': file_metadata.get('modifiedTime', ''),
+                    'size': file_metadata.get('size', ''),
+                    'owner': file_metadata.get('owners', [{}])[0].get('displayName', '') if file_metadata.get('owners') else ''
+                })
+            except Exception as e:
+                ctx.log.error(f"Error getting metadata for file {file['id']}: {str(e)}")
+                # Add basic info we already have
+                results.append({
+                    'id': file.get('id', ''),
+                    'name': file.get('name', ''),
+                    'mimeType': file.get('mimeType', ''),
+                    'link': file.get('webViewLink', ''),
+                    'error': str(e)
+                })
+                
         # Store in state
-        if hasattr(deps, 'state'):
-            deps.state['drive_files'] = files
+        if hasattr(ctx.deps, 'state'):
+            ctx.deps.state['drive_files'] = results
         
-        logger.info(f"Retrieved {len(files)} matching files from Drive")
-        return files
+        return results
     
     except Exception as e:
-        logger.error(f"Error searching Drive: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+        ctx.log.error(f"Error searching Drive: {str(e)}")
+        ctx.log.error(f"Traceback: {traceback.format_exc()}")
+        return []
 
 async def chunk_and_embed_document(document: str, model: SentenceTransformer, chunk_size: int = 500, overlap: int = 50) -> List[Tuple[str, np.ndarray]]:
     """
