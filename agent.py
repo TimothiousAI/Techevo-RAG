@@ -749,10 +749,10 @@ class TechevoRagAgent:
                     
                     if tool == 'search_emails':
                         try:
-                            # Use the new search_emails with ctx and gmail_query
-                            logger.info(f"Searching emails with query: {gmail_query}")
-                            # Pass context and query directly to the tool
-                            emails = await tool_func(ctx, gmail_query)
+                            # Use the raw query instead of the constructed Gmail query
+                            logger.info(f"Searching emails with raw query: {query}")
+                            # Pass context and raw query directly to the tool
+                            emails = await tool_func(ctx, query)
                             result['data']['emails'] = emails
                             deps.state['processed_emails'] = emails
                             
@@ -784,8 +784,8 @@ class TechevoRagAgent:
                             logger.info("No emails in state, running search_emails first")
                             if 'search_emails' in self.available_tools:
                                 try:
-                                    # Use the constructed Gmail query with the new method signature
-                                    emails = await self.available_tools['search_emails'](ctx, gmail_query)
+                                    # Use raw query directly
+                                    emails = await self.available_tools['search_emails'](ctx, query)
                                     deps.state['processed_emails'] = emails
                                 except Exception as e:
                                     logger.error(f"Error searching emails before download: {str(e)}")
@@ -798,8 +798,8 @@ class TechevoRagAgent:
                                     for attachment in email.get('attachments', []):
                                         logger.info(f"Downloading attachment {attachment.get('filename', 'unknown')} from email {email.get('id', 'unknown')}")
                                         try:
-                                            # Update to use the context based method signature
-                                            download_result = await tool_func(ctx, gmail_query)
+                                            # Update to use the context based method signature with raw query
+                                            download_result = await tool_func(ctx, query)
                                             attachment_results.append(download_result)
                                         except Exception as e:
                                             logger.error(f"Error downloading attachment: {str(e)}")
@@ -816,7 +816,6 @@ class TechevoRagAgent:
                             # Log attachment download results
                             logfire.info("Attachment download results",
                                 query=query,
-                                gmail_query=gmail_query,
                                 attachment_count=len(attachment_results),
                                 success_count=sum(1 for a in attachment_results if a.get('status') != 'error'),
                                 error_count=sum(1 for a in attachment_results if a.get('status') == 'error')
@@ -915,17 +914,30 @@ class TechevoRagAgent:
                     logger.warning(f"Tool {tool} not available and could not be created")
                     result['data'][tool] = {"status": "unavailable", "message": f"Tool {tool} not available"}
             
-            # Track progress
-            try:
-                progress_record = {
-                    'email_id': 'system',
-                    'file_hash': hashlib.md5(query.encode()).hexdigest(),
-                    'status': 'completed',
-                    'filename': f'query_{int(time.time())}'
-                }
-                await agent_tools.track_progress(ctx, **progress_record)
-            except Exception as e:
-                logger.error(f"Failed to track progress: {e}")
+            # Track progress with proper Supabase insert
+            if deps.supabase:
+                try:
+                    logger.info("Storing workflow result in Supabase")
+                    # Create a simplified record for storage
+                    record = {
+                        'query': query,
+                        'gmail_query': gmail_query,
+                        'timestamp': datetime.now().isoformat(),
+                        'email_count': len(deps.state.get('processed_emails', [])),
+                        'has_attachments': any(email.get('attachments') for email in deps.state.get('processed_emails', [])),
+                        'status': 'completed',
+                        'runtime': time.time() - started_at
+                    }
+                    
+                    # Execute synchronous insert
+                    insert_response = deps.supabase.table('processed_items').insert(record).execute()
+                    logger.info(f"Supabase insert response: {insert_response}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to store result in Supabase: {str(e)}")
+                    logger.error(traceback.format_exc())
+            else:
+                logger.warning("Supabase client not available, skipping result storage")
             
             # Calculate runtime
             runtime = time.time() - started_at

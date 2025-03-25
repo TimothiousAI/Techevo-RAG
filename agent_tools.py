@@ -86,44 +86,25 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict]:
     Returns:
         List of emails with metadata
     """
-    ctx.log.info(f"Searching emails with query: {query}")
+    ctx.log.info(f"Searching emails with raw query: {query}")
     gmail_service = ctx.deps.gmail_service
-    archon = ctx.deps.archon_client
     
     if not gmail_service:
         ctx.log.error("Gmail service not initialized")
         raise ValueError("Gmail service not initialized")
     
-    # Use Archon to parse search parameters
     try:
-        ctx.log.info(f"Refining email search criteria for: {query}")
-        search_prompt = EMAIL_SEARCH_PROMPT.format(query=query)
-        
-        search_response = await archon.generate(
-            model="gpt-4o",
-            prompt=search_prompt
-        )
-        
-        if 'error' in search_response:
-            ctx.log.error(f"Error getting search criteria: {search_response['error']}")
-            search_criteria = query
-        else:
-            search_criteria = search_response['response']
-            ctx.log.info(f"Refined search criteria: {search_criteria}")
-    except Exception as e:
-        ctx.log.error(f"Error generating search criteria: {e}")
-        ctx.log.error(f"Traceback: {traceback.format_exc()}")
-        search_criteria = query  # Fallback to original query
-    
-    try:
-        ctx.log.info(f"Performing live Gmail search with criteria: {search_criteria}")
+        # Use raw query directly without refinement
+        ctx.log.info(f"Performing Gmail search with raw query: {query}")
         
         # Format 'full' retrieves the full email content
         results = gmail_service.users().messages().list(
             userId='me',
-            q=search_criteria,
-            maxResults=20  # Increased from 10 to ensure we get more results
+            q=query,
+            maxResults=30  # Increased from 20 to ensure we get more results
         ).execute()
+        
+        ctx.log.info(f"Raw Gmail API response: {results}")
         
         messages = results.get('messages', [])
         ctx.log.info(f"Found {len(messages)} potential messages")
@@ -177,10 +158,8 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict]:
                 'attachments': attachments
             }
             
-            # Only add emails with attachments if we're specifically searching for attachments
-            if 'attachment' in query.lower() and not attachments:
-                ctx.log.info(f"Skipping email {email_data['id']} without attachments since query mentions attachments")
-                continue
+            # Log detailed info about each email
+            ctx.log.info(f"Processed email: id={email['id']}, from={email['from']}, subject={email['subject']}, attachments={len(attachments)}")
                 
             emails.append(email)
         
@@ -188,13 +167,13 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict]:
         if hasattr(ctx.deps, 'state'):
             ctx.deps.state['processed_emails'] = emails
         
-        ctx.log.info(f"Retrieved {len(emails)} matching emails (live search)")
+        ctx.log.info(f"Retrieved {len(emails)} matching emails (raw query search)")
         return emails
     
     except Exception as e:
         ctx.log.error(f"Error searching emails: {e}")
         ctx.log.error(f"Traceback: {traceback.format_exc()}")
-        return []  # Return empty list instead of raising, to continue with workflow
+        return []  # Return empty list instead of raising to continue with workflow
 
 async def download_attachment(ctx: AgentContext, query: str) -> List[Dict]:
     """
