@@ -201,7 +201,7 @@ def initialize_services():
             try:
                 # Create synchronous Supabase client
                 logger.info(f"Creating Supabase client with URL starting with: {supabase_url[:10]}...")
-                supabase = create_client(supabase_url, supabase_key, options={"asynchronous": False})
+                supabase = create_client(supabase_url, supabase_key)
                 # Validate connection by making a simple query
                 result = supabase.table('processed_items').select('id').limit(1).execute()
                 logger.info("Supabase connection validated successfully")
