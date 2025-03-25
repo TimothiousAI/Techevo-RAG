@@ -18,6 +18,9 @@ import streamlit as st
 from dotenv import load_dotenv
 import logfire
 
+# Load environment variables first thing
+load_dotenv(dotenv_path=".env", verbose=True)
+
 from agent import (
     TechevoRagAgent,
     EnhancedDeps, 
@@ -38,8 +41,6 @@ logfire.configure(
 
 logger = logging.getLogger(__name__)
 
-load_dotenv()
-
 # Initialize session state
 if 'initialized' not in st.session_state:
     st.session_state.initialized = False
@@ -54,6 +55,53 @@ if 'initialized' not in st.session_state:
     st.session_state.processing = False
     st.session_state.chat_history = []
     st.session_state.last_refresh = time.time()
+
+# Streamlit app setup
+st.set_page_config(
+    page_title="Techevo-RAG",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Debug: Check if Supabase credentials are loaded
+supabase_url = os.getenv('SUPABASE_URL')
+supabase_key = os.getenv('SUPABASE_KEY')
+creds_path = os.getenv('CREDENTIALS_JSON_PATH')
+st.sidebar.title("Environment Debug")
+st.sidebar.text(f"Current directory: {os.getcwd()}")
+st.sidebar.text(f"Supabase URL exists: {bool(supabase_url)}")
+st.sidebar.text(f"Supabase KEY exists: {bool(supabase_key)}")
+st.sidebar.text(f"Credentials path: {creds_path}")
+st.sidebar.text(f"Creds path exists: {os.path.exists(creds_path) if creds_path else False}")
+
+# Show .env file contents (masked)
+env_path = os.path.join(os.getcwd(), '.env')
+if os.path.exists(env_path):
+    with st.sidebar.expander("View .env file (masked)"):
+        try:
+            with open(env_path, 'r') as f:
+                env_lines = f.readlines()
+                
+            masked_lines = []
+            for line in env_lines:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    key, value = line.split('=', 1)
+                    # Mask the value except first and last 2 chars
+                    if len(value) > 6:
+                        masked_value = value[:2] + '*' * (len(value) - 4) + value[-2:]
+                    else:
+                        masked_value = '******'
+                    masked_lines.append(f"{key}={masked_value}")
+                else:
+                    masked_lines.append(line)
+            
+            st.code('\n'.join(masked_lines), language='bash')
+        except Exception as e:
+            st.error(f"Error reading .env: {str(e)}")
+else:
+    st.sidebar.error(f".env file not found at {env_path}")
 
 # Define a synchronous function for service initialization
 def initialize_services():
@@ -120,26 +168,51 @@ def initialize_services():
         from sentence_transformers import SentenceTransformer
         embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Set up Supabase client
+        # Set up Supabase client with more robust credential handling
+        # Try direct environment variables first
         supabase_url = os.getenv('SUPABASE_URL')
         supabase_key = os.getenv('SUPABASE_KEY')
         
+        # If credentials not found, try to directly read from .env file
+        if not supabase_url or not supabase_key:
+            import re
+            env_path = os.path.join(os.getcwd(), '.env')
+            if os.path.exists(env_path):
+                logger.info(f"Found .env file at {env_path}, reading directly")
+                with open(env_path, 'r') as f:
+                    env_content = f.read()
+                    # Extract Supabase URL using regex
+                    url_match = re.search(r'SUPABASE_URL\s*=\s*(.*?)(?:\n|$)', env_content)
+                    if url_match:
+                        supabase_url = url_match.group(1).strip()
+                        logger.info(f"Extracted SUPABASE_URL: {supabase_url[:10]}...")
+                    # Extract Supabase key using regex
+                    key_match = re.search(r'SUPABASE_KEY\s*=\s*(.*?)(?:\n|$)', env_content)
+                    if key_match:
+                        supabase_key = key_match.group(1).strip()
+                        logger.info(f"Extracted SUPABASE_KEY: {supabase_key[:5]}...")
+        
+        # Check if we have valid credentials now
         if not supabase_url or not supabase_key:
             logger.error("SUPABASE_URL or SUPABASE_KEY is missing in .env")
-            raise ValueError("SUPABASE_URL or SUPABASE_KEY is missing in .env")
-        
-        try:
-            # Create synchronous Supabase client
-            supabase = create_client(supabase_url, supabase_key, options={"asynchronous": False})
-            # Validate connection by making a simple query
-            result = supabase.table('processed_items').select('id').limit(1).execute()
-            logger.info("Supabase connection validated")
-        except Exception as e:
-            logger.error(f"Supabase connection failed: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            # Continue without Supabase
+            st.error("Supabase credentials missing. Check your .env file.")
             supabase = None
-            logger.warning("Continuing without Supabase connection")
+        else:
+            try:
+                # Create synchronous Supabase client
+                logger.info(f"Creating Supabase client with URL starting with: {supabase_url[:10]}...")
+                supabase = create_client(supabase_url, supabase_key, options={"asynchronous": False})
+                # Validate connection by making a simple query
+                result = supabase.table('processed_items').select('id').limit(1).execute()
+                logger.info("Supabase connection validated successfully")
+                st.success("✅ Supabase connection successful!")
+            except Exception as e:
+                logger.error(f"Supabase connection failed: {str(e)}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                # Continue without Supabase
+                supabase = None
+                st.error(f"❌ Supabase connection error: {str(e)}")
+                logger.warning("Continuing without Supabase connection")
         
         # Set up Archon client
         try:
@@ -241,14 +314,6 @@ def add_log(message: str):
         
     # Also log to logfire for cloud logging
     logfire.info(message)
-
-# Streamlit app setup
-st.set_page_config(
-    page_title="Techevo-RAG",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 st.title("📊 Techevo-RAG Chat Interface")
 st.markdown("""
