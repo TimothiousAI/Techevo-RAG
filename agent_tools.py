@@ -87,7 +87,7 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict]:
     Returns:
         List of emails with metadata
     """
-    ctx.log.info(f"Searching emails with raw query: {query}")
+    ctx.log.info(f"Searching emails with query: {query}")
     gmail_service = ctx.deps.gmail_service
     
     if not gmail_service:
@@ -95,17 +95,15 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict]:
         raise ValueError("Gmail service not initialized")
     
     try:
-        # Use raw query directly without refinement
-        ctx.log.info(f"Performing Gmail search with raw query: {query}")
+        # Use query directly
+        ctx.log.info(f"Performing Gmail search with query: {query}")
         
         # Format 'full' retrieves the full email content
         results = gmail_service.users().messages().list(
             userId='me',
             q=query,
-            maxResults=30  # Increased from 20 to ensure we get more results
+            maxResults=30
         ).execute()
-        
-        ctx.log.info(f"Raw Gmail API response: {results}")
         
         messages = results.get('messages', [])
         ctx.log.info(f"Found {len(messages)} potential messages")
@@ -136,39 +134,69 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict]:
                     email_data['payload']['body']['data'].encode('ASCII')
                 ).decode('utf-8')
             
-            # Extract attachments metadata
+            # Extract only true attachments (excluding inline content)
             attachments = []
             if 'parts' in email_data['payload']:
                 for part in email_data['payload']['parts']:
-                    if 'filename' in part and part['filename']:
-                        attachments.append({
-                            'id': part['body'].get('attachmentId', ''),
-                            'filename': part['filename'],
-                            'mimeType': part['mimeType']
-                        })
+                    # Check if it's a true attachment (has filename and proper content disposition)
+                    is_attachment = False
+                    if part.get('filename') and part['filename'].strip():
+                        # Check for Content-Disposition header
+                        for header in part.get('headers', []):
+                            if header.get('name', '').lower() == 'content-disposition':
+                                if 'attachment' in header.get('value', '').lower():
+                                    is_attachment = True
+                                    break
+                        
+                        # If no content-disposition header, check if it's a common attachment type
+                        if not is_attachment:
+                            mime_type = part.get('mimeType', '')
+                            common_attachment_types = [
+                                'application/pdf', 
+                                'application/msword',
+                                'application/vnd.openxmlformats-officedocument',
+                                'application/vnd.ms-excel',
+                                'application/zip',
+                                'application/x-zip-compressed',
+                                'image/',
+                                'audio/',
+                                'video/'
+                            ]
+                            if any(mime_type.startswith(t) for t in common_attachment_types):
+                                is_attachment = True
+                        
+                        # Add to attachments if it's a true attachment
+                        if is_attachment and 'body' in part and 'attachmentId' in part['body']:
+                            attachments.append({
+                                'id': part['body'].get('attachmentId', ''),
+                                'filename': part['filename'],
+                                'mimeType': part['mimeType'],
+                                'size': part['body'].get('size', 0)
+                            })
             
-            email = {
-                'id': email_data['id'],
-                'threadId': email_data['threadId'],
-                'subject': headers.get('subject', 'No Subject'),
-                'from': headers.get('from', 'Unknown'),
-                'to': headers.get('to', 'Unknown'),
-                'date': headers.get('date', 'Unknown'),
-                'snippet': email_data.get('snippet', ''),
-                'body': body,
-                'attachments': attachments
-            }
-            
-            # Log detailed info about each email
-            ctx.log.info(f"Processed email: id={email['id']}, from={email['from']}, subject={email['subject']}, attachments={len(attachments)}")
+            # Only include emails that have true attachments
+            if attachments:
+                email = {
+                    'id': email_data['id'],
+                    'threadId': email_data['threadId'],
+                    'subject': headers.get('subject', 'No Subject'),
+                    'from': headers.get('from', 'Unknown'),
+                    'to': headers.get('to', 'Unknown'),
+                    'date': headers.get('date', 'Unknown'),
+                    'snippet': email_data.get('snippet', ''),
+                    'body': body,
+                    'attachments': attachments
+                }
                 
-            emails.append(email)
+                # Log detailed info about each email with true attachments
+                ctx.log.info(f"Found email with true attachments: id={email['id']}, from={email['from']}, subject={email['subject']}, attachments={len(attachments)}")
+                emails.append(email)
         
         # Store in state
         if hasattr(ctx.deps, 'state'):
             ctx.deps.state['processed_emails'] = emails
         
-        ctx.log.info(f"Retrieved {len(emails)} matching emails (raw query search)")
+        ctx.log.info(f"Retrieved {len(emails)} emails with true attachments")
         return emails
     
     except Exception as e:
@@ -203,13 +231,51 @@ async def download_attachment(ctx: AgentContext, email_id: str, attachment_id: s
         
         # Find the attachment part and filename
         parts = message.get('payload', {}).get('parts', [])
-        for part in parts:
-            if part.get('body', {}).get('attachmentId') == attachment_id:
+        part = None
+        is_true_attachment = False
+        
+        for p in parts:
+            # Check if this is the part we're looking for
+            if p.get('body', {}).get('attachmentId') == attachment_id:
+                part = p
                 filename = part.get('filename', 'unknown')
                 mime_type = part.get('mimeType', 'application/octet-stream')
+                
+                # Verify it's a true attachment
+                for header in p.get('headers', []):
+                    if header.get('name', '').lower() == 'content-disposition':
+                        if 'attachment' in header.get('value', '').lower():
+                            is_true_attachment = True
+                            break
+                
+                # If no content-disposition header, check if it's a common attachment type
+                if not is_true_attachment:
+                    common_attachment_types = [
+                        'application/pdf', 
+                        'application/msword',
+                        'application/vnd.openxmlformats-officedocument',
+                        'application/vnd.ms-excel',
+                        'application/zip',
+                        'application/x-zip-compressed',
+                        'image/',
+                        'audio/',
+                        'video/'
+                    ]
+                    if any(mime_type.startswith(t) for t in common_attachment_types):
+                        is_true_attachment = True
+                
                 break
         
-        ctx.log.info(f'Downloading attachment: {filename} from email {email_id}')
+        # Skip if not a true attachment
+        if not part or not is_true_attachment:
+            ctx.log.warning(f'Skipped non-true attachment or invalid attachment ID: {attachment_id}')
+            return {
+                'filename': filename,
+                'status': 'skipped',
+                'reason': 'Not a true attachment or invalid ID'
+            }
+        
+        ctx.log.info(f'Downloading true attachment: {filename} from email {email_id}')
         
         # Download attachment data
         attachment_data = gmail_service.users().messages().attachments().get(
@@ -224,6 +290,12 @@ async def download_attachment(ctx: AgentContext, email_id: str, attachment_id: s
         # Decode attachment data
         file_data = io.BytesIO(base64.urlsafe_b64decode(attachment_data['data']))
         
+        # Determine proper MIME type if not available
+        if not mime_type or mime_type == 'application/octet-stream':
+            import mimetypes
+            guessed_type = mimetypes.guess_type(filename)[0]
+            mime_type = guessed_type if guessed_type else 'application/octet-stream'
+        
         # Create Drive upload media
         media = MediaIoBaseUpload(
             file_data,
@@ -234,7 +306,8 @@ async def download_attachment(ctx: AgentContext, email_id: str, attachment_id: s
         # Prepare file metadata
         file_metadata = {
             'name': filename,
-            'parents': [folder_id] if folder_id else None
+            'parents': [folder_id] if folder_id else None,
+            'mimeType': mime_type
         }
         
         ctx.log.info(f'Uploading {filename} to Drive folder {folder_id}')
@@ -243,7 +316,7 @@ async def download_attachment(ctx: AgentContext, email_id: str, attachment_id: s
         uploaded_file = drive_service.files().create(
             body=file_metadata,
             media_body=media,
-            fields='id,name,mimeType,webViewLink'  # Request additional metadata
+            fields='id,name,mimeType,webViewLink,size'  # Request additional metadata
         ).execute()
         
         ctx.log.info(f'Successfully uploaded {filename} to Drive with ID: {uploaded_file["id"]}')
@@ -253,6 +326,7 @@ async def download_attachment(ctx: AgentContext, email_id: str, attachment_id: s
             'drive_id': uploaded_file['id'],
             'mime_type': uploaded_file.get('mimeType'),
             'web_link': uploaded_file.get('webViewLink'),
+            'size': uploaded_file.get('size', 0),
             'status': 'success'
         }
         

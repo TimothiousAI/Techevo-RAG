@@ -620,6 +620,7 @@ class TechevoRagAgent:
                 intent_tools = intent_data.get('tools', ['search_emails', 'perform_rag'])
                 sender = intent_data.get('sender')
                 has_attachment = intent_data.get('has_attachment', False)
+                keywords = intent_data.get('keywords', '')
                 logger.info(f"Predicted intent: tools={intent_tools}, sender={sender}, has_attachment={has_attachment}")
             else:
                 # Fallback without Archon
@@ -628,14 +629,23 @@ class TechevoRagAgent:
                 intent_tools = intent_data.get('tools', ['search_emails', 'perform_rag'])
                 sender = intent_data.get('sender')
                 has_attachment = intent_data.get('has_attachment', False)
+                keywords = intent_data.get('keywords', '')
                 logger.info(f"Fallback intent: tools={intent_tools}, sender={sender}, has_attachment={has_attachment}")
             
-            # Construct Gmail search query
+            # Construct Gmail search query with better handling of year/date filters
             gmail_query_parts = []
             if sender:
                 gmail_query_parts.append(f"from:{sender}")
             if has_attachment:
                 gmail_query_parts.append("has:attachment")
+            if keywords and keywords != query:
+                gmail_query_parts.append(keywords)
+            
+            # Add date range if query contains year references
+            if '2025' in query:
+                gmail_query_parts.append("after:2025/01/01 before:2026/01/01")
+            elif '2024' in query:
+                gmail_query_parts.append("after:2024/01/01 before:2025/01/01")
             
             # Use constructed query for Gmail search, fallback to raw query if no specific criteria
             gmail_query = " ".join(gmail_query_parts) if gmail_query_parts else query
@@ -729,38 +739,51 @@ class TechevoRagAgent:
                                     logger.error(traceback.format_exc())
                                     continue
                             
-                            # Process each email's attachments
+                            # Process each email's attachments with retry mechanism
+                            max_retries = 3
                             for email in deps.state['processed_emails']:
                                 if email.get('attachments'):
                                     for attachment in email.get('attachments', []):
                                         attachment_id = attachment.get('id')
                                         if attachment_id and attachment_id not in downloaded_ids:
-                                            try:
-                                                # Download and upload attachment
-                                                download_result = await tool_func(
-                                                    ctx,
-                                                    email_id=email['id'],
-                                                    attachment_id=attachment_id,
-                                                    folder_id=folder_id
-                                                )
-                                                
-                                                if download_result['status'] == 'success':
-                                                    downloaded_ids.add(attachment_id)
-                                                    attachment_results.append(download_result)
-                                                    logger.info(f"Successfully processed attachment: {download_result['filename']}")
-                                                else:
-                                                    logger.warning(f"Failed to process attachment: {download_result.get('error', 'Unknown error')}")
-                                                    attachment_results.append(download_result)
-                                                    # Don't break here, try other attachments
-                                            except Exception as e:
-                                                logger.error(f"Error processing attachment: {str(e)}")
-                                                logger.error(traceback.format_exc())
-                                                attachment_results.append({
-                                                    'status': 'error',
-                                                    'error': str(e),
-                                                    'email_id': email['id'],
-                                                    'attachment_id': attachment_id
-                                                })
+                                            success = False
+                                            # Try up to max_retries times
+                                            for attempt in range(max_retries):
+                                                try:
+                                                    # Download and upload attachment
+                                                    download_result = await tool_func(
+                                                        ctx,
+                                                        email_id=email['id'],
+                                                        attachment_id=attachment_id,
+                                                        folder_id=folder_id
+                                                    )
+                                                    
+                                                    if download_result['status'] == 'success':
+                                                        downloaded_ids.add(attachment_id)
+                                                        attachment_results.append(download_result)
+                                                        logger.info(f"Successfully processed attachment: {download_result['filename']} (attempt {attempt+1})")
+                                                        success = True
+                                                        break
+                                                    elif download_result['status'] == 'skipped':
+                                                        logger.info(f"Skipped non-true attachment: {download_result.get('filename', 'unknown')}")
+                                                        attachment_results.append(download_result)
+                                                        success = True
+                                                        break
+                                                    else:
+                                                        logger.warning(f"Attempt {attempt+1} failed for attachment {attachment_id}: {download_result.get('error', 'Unknown error')}")
+                                                        if attempt == max_retries - 1:
+                                                            attachment_results.append(download_result)
+                                                            logger.error(f"Max retries reached for attachment {attachment_id}")
+                                                except Exception as e:
+                                                    logger.error(f"Error on attempt {attempt+1} for attachment {attachment_id}: {str(e)}")
+                                                    if attempt == max_retries - 1:
+                                                        attachment_results.append({
+                                                            'status': 'error',
+                                                            'error': str(e),
+                                                            'email_id': email['id'],
+                                                            'attachment_id': attachment_id,
+                                                            'filename': attachment.get('filename', 'unknown')
+                                                        })
                             
                             result['data']['attachments'] = attachment_results
                             deps.state['downloaded_attachments'] = attachment_results
@@ -770,7 +793,8 @@ class TechevoRagAgent:
                                 query=query,
                                 attachment_count=len(attachment_results),
                                 success_count=sum(1 for a in attachment_results if a.get('status') == 'success'),
-                                error_count=sum(1 for a in attachment_results if a.get('status') == 'error')
+                                error_count=sum(1 for a in attachment_results if a.get('status') == 'error'),
+                                skipped_count=sum(1 for a in attachment_results if a.get('status') == 'skipped')
                             )
                         else:
                             logger.warning("No emails with attachments found")
@@ -821,8 +845,50 @@ class TechevoRagAgent:
                         
                         if documents:
                             try:
-                                logger.info(f"Performing RAG on {len(documents)} documents")
-                                rag_result = await tool_func(ctx, query, documents)
+                                # Create a sub-agent through Archon for RAG processing
+                                rag_sub_agent_id = None
+                                if 'archon' in self.services:
+                                    try:
+                                        rag_sub_agent_id = await self.services['archon'].create_agent(
+                                            skills=['text_extraction', 'vector_indexing', 'rag_processing'],
+                                            level='sub-agent',
+                                            task='Process documents and perform RAG'
+                                        )
+                                        logger.info(f"Created RAG sub-agent with ID: {rag_sub_agent_id}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to create RAG sub-agent: {str(e)}")
+                                
+                                # Perform RAG with the main tool or use the sub-agent
+                                if rag_sub_agent_id:
+                                    # Use the sub-agent to process documents
+                                    logger.info(f"Using RAG sub-agent {rag_sub_agent_id} to process {len(documents)} documents")
+                                    
+                                    # Prepare a simplified request for the sub-agent
+                                    rag_request = {
+                                        'query': query,
+                                        'document_count': len(documents),
+                                        'document_sample': documents[0][:500] + "..." if documents else ""
+                                    }
+                                    
+                                    # Run the sub-agent via Archon
+                                    sub_agent_response = await self.services['archon'].run_agent(
+                                        thread_id=self.services['archon'].thread_id,
+                                        user_input=f"Process these documents for RAG: {json.dumps(rag_request)}"
+                                    )
+                                    
+                                    # Store the sub-agent result
+                                    rag_result = {
+                                        'query': query,
+                                        'response': sub_agent_response,
+                                        'document_count': len(documents),
+                                        'status': 'success',
+                                        'processed_by': f'sub-agent:{rag_sub_agent_id}'
+                                    }
+                                else:
+                                    # Fall back to the built-in RAG tool
+                                    logger.info(f"Performing RAG on {len(documents)} documents with built-in tool")
+                                    rag_result = await tool_func(ctx, query, documents)
+                                
                                 result['data']['rag_result'] = rag_result
                                 deps.state['rag_results'] = rag_result
                                 
@@ -830,9 +896,9 @@ class TechevoRagAgent:
                                 logfire.info("RAG results",
                                     query=query,
                                     document_count=len(documents),
-                                    chunks_used=len(rag_result.get('chunks_used', [])),
+                                    chunks_used=len(rag_result.get('chunks_used', [])) if 'chunks_used' in rag_result else 0,
                                     status=rag_result.get('status'),
-                                    model=rag_result.get('model', 'gemini-2.0-flash'),
+                                    processor=rag_result.get('processed_by', 'built-in'),
                                     response_length=len(rag_result.get('response', ''))
                                 )
                             except Exception as e:
@@ -863,20 +929,49 @@ class TechevoRagAgent:
                             result['data'][tool] = {"status": "error", "error": str(e)}
                 
                 else:
-                    logger.warning(f"Tool {tool} not available and could not be created")
+                    logger.warning(f"Tool {tool} not available")
                     result['data'][tool] = {"status": "unavailable", "message": f"Tool {tool} not available"}
             
             # Track progress with proper Supabase insert
             if deps.supabase:
                 try:
                     logger.info("Storing workflow result in Supabase")
+                    
+                    # Store individual attachment records for better tracking
+                    if 'attachments' in result['data'] and result['data']['attachments']:
+                        for attachment in result['data']['attachments']:
+                            if attachment['status'] == 'success':
+                                # Find the corresponding email
+                                email = next((e for e in deps.state.get('processed_emails', []) 
+                                         if e['id'] == attachment.get('email_id')), {})
+                                
+                                attachment_record = {
+                                    'query': query,
+                                    'email_id': attachment.get('email_id', 'unknown'),
+                                    'email_subject': email.get('subject', 'Unknown'),
+                                    'email_from': email.get('from', 'Unknown'),
+                                    'attachment_filename': attachment.get('filename', 'unknown'),
+                                    'drive_id': attachment.get('drive_id', ''),
+                                    'mime_type': attachment.get('mime_type', 'unknown'),
+                                    'size': attachment.get('size', 0),
+                                    'status': 'completed',
+                                    'timestamp': datetime.now().isoformat(),
+                                    'web_link': attachment.get('web_link', '')
+                                }
+                                
+                                # Execute synchronous insert for each attachment
+                                attachment_response = deps.supabase.table('attachment_items').insert(attachment_record).execute()
+                                logger.info(f"Supabase attachment insert response: {attachment_response}")
+                    
                     # Create a simplified record for storage with email_count
                     record = {
                         'query': query,
                         'gmail_query': gmail_query,
                         'timestamp': datetime.now().isoformat(),
                         'email_count': len(deps.state.get('processed_emails', [])),
-                        'has_attachments': any(email.get('attachments') for email in deps.state.get('processed_emails', [])),
+                        'attachment_count': len(result['data'].get('attachments', [])),
+                        'success_attachments': sum(1 for a in result['data'].get('attachments', []) if a.get('status') == 'success'),
+                        'has_rag_result': 'rag_result' in result['data'],
                         'status': 'completed',
                         'runtime': time.time() - started_at,
                         'result': json.dumps(result['data'], default=str)  # Store full result as JSON
