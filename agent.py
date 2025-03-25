@@ -614,52 +614,31 @@ class TechevoRagAgent:
                 'start_time': started_at
             }
             
-            # Create new thread if needed
-            if not self.services.get('archon') or not self.services['archon'].thread_id:
-                try:
-                    if 'archon' in self.services:
-                        self.services['archon'].thread_id = await self.services['archon'].create_thread()
-                    else:
-                        logger.error("Archon service not available")
-                except Exception as e:
-                    logger.error(f"Failed to create Archon thread: {e}")
-                    logger.error(traceback.format_exc())
-            
-            logger.info(f"Predicting intent for query: {query}")
-            
             # Get intent with enhanced search parameters
             if 'archon' in self.services:
                 intent_data = await predict_intent(query, self.services['archon'])
                 intent_tools = intent_data.get('tools', ['search_emails', 'perform_rag'])
                 sender = intent_data.get('sender')
-                keywords = intent_data.get('keywords', query)
                 has_attachment = intent_data.get('has_attachment', False)
-                logger.info(f"Predicted intent: tools={intent_tools}, sender={sender}, keywords={keywords}, has_attachment={has_attachment}")
+                logger.info(f"Predicted intent: tools={intent_tools}, sender={sender}, has_attachment={has_attachment}")
             else:
                 # Fallback without Archon
                 logger.warning("Archon service not available, using default intent prediction")
                 intent_data = fallback_intent(query)
                 intent_tools = intent_data.get('tools', ['search_emails', 'perform_rag'])
                 sender = intent_data.get('sender')
-                keywords = intent_data.get('keywords', query)
                 has_attachment = intent_data.get('has_attachment', False)
-                logger.info(f"Fallback intent: tools={intent_tools}, sender={sender}, keywords={keywords}, has_attachment={has_attachment}")
+                logger.info(f"Fallback intent: tools={intent_tools}, sender={sender}, has_attachment={has_attachment}")
             
             # Construct Gmail search query
-            search_query = []
+            gmail_query_parts = []
             if sender:
-                search_query.append(f"from:{sender}")
-            if keywords and keywords != query:  # Only add if keywords are specific and not the full query
-                # Extract meaningful keywords if possible
-                search_query.append(keywords)
+                gmail_query_parts.append(f"from:{sender}")
             if has_attachment:
-                search_query.append("has:attachment")
-                
-            # Add default time range if no specific criteria
-            if not search_query:
-                search_query.append(query)  # Use original query if no specific params extracted
-                
-            gmail_query = " ".join(search_query)
+                gmail_query_parts.append("has:attachment")
+            
+            # Use constructed query for Gmail search, fallback to raw query if no specific criteria
+            gmail_query = " ".join(gmail_query_parts) if gmail_query_parts else query
             logger.info(f"Constructed Gmail search query: {gmail_query}")
             
             # Store the constructed query in the state
@@ -673,70 +652,6 @@ class TechevoRagAgent:
                 'timestamp': datetime.now().isoformat()
             }
             
-            # Check if any tools are missing and create new sub-agents if needed
-            missing_tools = [tool for tool in intent_tools if tool not in self.available_tools]
-            if missing_tools:
-                logger.info(f"Missing tools: {missing_tools}. Attempting to create new sub-agent...")
-                
-                # Determine skills based on missing tools
-                skills = []
-                for tool in missing_tools:
-                    if 'search' in tool.lower():
-                        skills.append("searching")
-                    elif 'download' in tool.lower():
-                        skills.append("file_download")
-                    elif 'rag' in tool.lower() or 'process' in tool.lower():
-                        skills.append("rag_processing")
-                    else:
-                        skills.append("general_processing")
-                
-                # Create a new sub-agent with Archon MCP
-                try:
-                    if 'archon' in self.services:
-                        agent_id = await self.services['archon'].create_agent(
-                            skills=list(set(skills)),  # Remove duplicates 
-                            level="sub-agent"
-                        )
-                        logger.info(f"Created new sub-agent with ID: {agent_id}")
-                        
-                        # Add the new agent to our collection
-                        self.sub_agents[agent_id] = skills
-                        
-                        # Create simulated functions for missing tools
-                        for tool_name in missing_tools:
-                            async def simulated_tool_fn(ctx, **kwargs):
-                                logger.info(f"Executing simulated {tool_name} with sub-agent {agent_id}")
-                                try:
-                                    # Run sub-agent through Archon
-                                    tool_query = f"Execute {tool_name} with parameters: {json.dumps(kwargs)}"
-                                    agent_response = await self.services['archon'].run_agent(
-                                        thread_id=self.services['archon'].thread_id,
-                                        user_input=tool_query
-                                    )
-                                    
-                                    return {
-                                        "status": "success", 
-                                        "data": agent_response,
-                                        "tool": tool_name,
-                                        "agent_id": agent_id
-                                    }
-                                except Exception as e:
-                                    logger.error(f"Error executing simulated {tool_name}: {str(e)}")
-                                    return {
-                                        "status": "error",
-                                        "error": str(e),
-                                        "tool": tool_name
-                                    }
-                            
-                            # Add the function to available tools
-                            self.available_tools[tool_name] = simulated_tool_fn
-                            logger.info(f"Added simulated tool: {tool_name}")
-                    else:
-                        logger.error("Cannot create sub-agent: Archon service not available")
-                except Exception as e:
-                    logger.error(f"Failed to create sub-agent: {str(e)}")
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-            
             # Create agent context for tool execution
             from agent_tools import AgentContext
             ctx = AgentContext(agent=self, deps=deps, log=logger)
@@ -749,10 +664,9 @@ class TechevoRagAgent:
                     
                     if tool == 'search_emails':
                         try:
-                            # Use the raw query instead of the constructed Gmail query
-                            logger.info(f"Searching emails with raw query: {query}")
-                            # Pass context and raw query directly to the tool
-                            emails = await tool_func(ctx, query)
+                            # Use the constructed Gmail query for search
+                            logger.info(f"Searching emails with Gmail query: {gmail_query}")
+                            emails = await tool_func(ctx, gmail_query)
                             result['data']['emails'] = emails
                             deps.state['processed_emails'] = emails
                             
@@ -918,7 +832,7 @@ class TechevoRagAgent:
             if deps.supabase:
                 try:
                     logger.info("Storing workflow result in Supabase")
-                    # Create a simplified record for storage
+                    # Create a simplified record for storage with email_count
                     record = {
                         'query': query,
                         'gmail_query': gmail_query,
@@ -926,7 +840,8 @@ class TechevoRagAgent:
                         'email_count': len(deps.state.get('processed_emails', [])),
                         'has_attachments': any(email.get('attachments') for email in deps.state.get('processed_emails', [])),
                         'status': 'completed',
-                        'runtime': time.time() - started_at
+                        'runtime': time.time() - started_at,
+                        'result': json.dumps(result['data'], default=str)  # Store full result as JSON
                     }
                     
                     # Execute synchronous insert
