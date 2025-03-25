@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 import logfire
 
 from agent import (
-    primary_agent, 
+    TechevoRagAgent,
     EnhancedDeps, 
     setup_google_services, 
     create_faiss_index,
@@ -29,17 +29,18 @@ from agent import (
 
 from supabase import create_client
 
+# Configure logfire with current arguments
 logfire.configure(
-    app_name="techevo-rag",
-    level="INFO",
-    capture_stdout=True,
-    capture_stderr=True
+    token=os.getenv('LOGFIRE_TOKEN'),
+    service_name='techevo-rag',
+    send_to_logfire=True
 )
 
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+# Initialize session state
 if 'initialized' not in st.session_state:
     st.session_state.initialized = False
     st.session_state.gmail_service = None
@@ -54,15 +55,63 @@ if 'initialized' not in st.session_state:
     st.session_state.chat_history = []
     st.session_state.last_refresh = time.time()
 
-# Define an async function that gets called by a sync wrapper
-async def initialize_services():
+# Define a synchronous function for service initialization
+def initialize_services():
     """Initialize all required services."""
     try:
         # Validate environment variables
         validate_env_vars()
         
         # Set up Google services
-        gmail_service, drive_service = await setup_google_services()
+        gmail_service = None
+        drive_service = None
+        
+        # Load credentials
+        credentials_path = os.getenv('CREDENTIALS_JSON_PATH')
+        if not credentials_path:
+            logger.error("CREDENTIALS_JSON_PATH not set in environment")
+            raise ValueError("CREDENTIALS_JSON_PATH environment variable is required")
+        
+        if not os.path.exists(credentials_path):
+            logger.error(f"Credentials file not found at {credentials_path}")
+            raise ValueError(f"Credentials file not found at {credentials_path}")
+        
+        # Synchronous setup for Google services
+        from googleapiclient.discovery import build
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from google.auth.transport.requests import Request
+        
+        # Define scopes
+        SCOPES = [
+            'https://www.googleapis.com/auth/gmail.readonly',
+            'https://www.googleapis.com/auth/drive',
+            'https://www.googleapis.com/auth/drive.file',
+            'https://www.googleapis.com/auth/drive.readonly'
+        ]
+        
+        creds = None
+        token_path = 'token.json'
+        
+        # Load existing token
+        if os.path.exists(token_path):
+            creds = Credentials.from_authorized_user_info(json.load(open(token_path)))
+        
+        # Refresh token if needed
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(token_path, 'w') as token:
+                token.write(creds.to_json())
+        
+        # If no valid credentials available, log error
+        if not creds or not creds.valid:
+            logger.error("No valid credentials found. Please run setup_google.py first")
+            st.error("No valid Google credentials found. Please run setup_google.py first")
+        else:
+            # Build Gmail and Drive services
+            gmail_service = build('gmail', 'v1', credentials=creds)
+            drive_service = build('drive', 'v3', credentials=creds)
+            logger.info("Google services initialized successfully")
         
         # Create FAISS index
         faiss_index = create_faiss_index(dimension=768)  # Use correct dimension for all-MiniLM-L6-v2
@@ -80,7 +129,8 @@ async def initialize_services():
             raise ValueError("SUPABASE_URL or SUPABASE_KEY is missing in .env")
         
         try:
-            supabase = create_client(supabase_url, supabase_key)
+            # Create synchronous Supabase client
+            supabase = create_client(supabase_url, supabase_key, options={"asynchronous": False})
             # Validate connection by making a simple query
             result = supabase.table('processed_items').select('id').limit(1).execute()
             logger.info("Supabase connection validated")
@@ -93,12 +143,13 @@ async def initialize_services():
         
         # Set up Archon client
         try:
+            # Create synchronous version of Archon client if needed
             archon_client = ArchonClient(
                 api_key=os.getenv('OPENAI_API_KEY'),
                 api_base=os.getenv('OPENAI_API_BASE')
             )
-            thread_id = await archon_client.create_thread()
-            logger.info(f"Archon thread created: {thread_id}")
+            # For synchronous operation, we'll create the thread when needed
+            logger.info(f"Archon client created")
         except Exception as e:
             logger.error(f"Error setting up Archon client: {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
@@ -147,7 +198,6 @@ async def run_agent_async(query: str, deps: EnhancedDeps):
         
         # Create agent if not already in session state
         if 'agent' not in st.session_state or st.session_state.agent is None:
-            from agent import TechevoRagAgent
             st.session_state.agent = TechevoRagAgent(services=services)
         
         # Run the workflow
@@ -211,12 +261,10 @@ st.sidebar.title("📝 System Status")
 status_container = st.sidebar.container()
 log_container = st.sidebar.container()
 
-# Initialize services asynchronously within Streamlit's main loop
+# Initialize services synchronously within Streamlit's main loop
 if not st.session_state.initialized:
     with st.spinner("Initializing services..."):
-        # Use asyncio.ensure_future to schedule the coroutine
-        loop = asyncio.get_event_loop()
-        future = asyncio.ensure_future(initialize_services())
+        # Use synchronous initialization
         (
             st.session_state.gmail_service,
             st.session_state.drive_service,
@@ -224,7 +272,7 @@ if not st.session_state.initialized:
             st.session_state.supabase,
             st.session_state.archon_client,
             st.session_state.deps
-        ) = loop.run_until_complete(future)
+        ) = initialize_services()
         if st.session_state.deps is not None:
             st.session_state.initialized = True
             add_log("Services initialized successfully")

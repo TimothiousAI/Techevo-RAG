@@ -58,7 +58,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configure logfire
-logfire.configure()
+logfire.configure(
+    token=os.getenv('LOGFIRE_TOKEN'),
+    service_name='techevo-rag',
+    send_to_logfire=True
+)
 
 # Load environment variables
 from dotenv import load_dotenv
