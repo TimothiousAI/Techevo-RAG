@@ -234,101 +234,72 @@ async def download_attachment(
         message = gmail_service.users().messages().get(userId='me', id=email_id).execute()
         
         # Find the attachment part
-        attachment_part = None
-        filename = None
-        mime_type = None
+        parts = message.get('payload', {}).get('parts', [])
+        part = next((p for p in parts if p.get('filename') and (p['body'].get('attachmentId') == attachment_id or f"{email_id}-{p['partId']}" == attachment_id)), None)
         
-        # Find the attachment part from message payload parts
-        if 'payload' in message and 'parts' in message['payload']:
-            for part in message['payload']['parts']:
-                if part.get('body', {}).get('attachmentId') == attachment_id:
-                    attachment_part = part
-                    break
-        
-        # If attachment part found, get filename and mime_type
-        if attachment_part:
-            # Get filename from headers
-            if 'headers' in attachment_part:
-                for header in attachment_part['headers']:
-                    if header['name'].lower() == 'content-disposition':
-                        # Look for filename in content-disposition
-                        match = re.search(r'filename="?([^";]+)"?', header['value'])
-                        if match:
-                            filename = match.group(1).strip()
-                    elif header['name'].lower() == 'content-type':
-                        # Extract MIME type from content-type header
-                        mime_type = header['value'].split(';')[0].strip()
-            
-            # If filename not found in content-disposition, try filename header
-            if not filename and 'filename' in attachment_part:
-                filename = attachment_part['filename']
-        
-        # If we still don't have a filename or no attachment part, this is not a true attachment
-        if not attachment_part or not filename:
+        if not part or not part.get('filename'):
             log.warning(f"No valid attachment part or filename found for attachment ID {attachment_id}")
             return {
                 'status': 'skipped',
-                'error': 'Not a true attachment - no valid attachment part or filename found',
+                'error': 'No valid attachment part or filename found',
                 'attachment_id': attachment_id
             }
         
-        # Check if this is a true attachment (not inline content)
-        # Look for content-disposition: attachment or common attachment types
-        is_true_attachment = False
+        filename = part.get('filename')
+        mime_type = part.get('mimeType', 'application/octet-stream')
         
-        # Check headers for content-disposition: attachment
-        if 'headers' in attachment_part:
-            for header in attachment_part['headers']:
-                if header['name'].lower() == 'content-disposition':
-                    if 'attachment' in header['value'].lower():
-                        is_true_attachment = True
-                        break
+        log.info(f"Processing attachment: {filename} (ID: {attachment_id}) with MIME type: {mime_type}")
         
-        # Check MIME type for common attachment types if not already confirmed
-        if not is_true_attachment and mime_type:
-            common_attachment_types = [
-                'application/pdf', 
-                'application/msword',
-                'application/vnd.openxmlformats-officedocument',
-                'application/vnd.ms-excel',
-                'application/vnd.ms-powerpoint',
-                'application/zip',
-                'application/x-zip-compressed',
-                'image/jpeg',
-                'image/png',
-                'image/gif',
-                'application/octet-stream'
-            ]
-            
-            if any(mime_type.startswith(t) for t in common_attachment_types):
-                is_true_attachment = True
+        # Check if this is a likely attachment based on filename extension
+        common_extensions = [
+            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+            '.zip', '.jpg', '.jpeg', '.png', '.gif', '.txt', '.csv'
+        ]
+        is_common_extension = any(filename.lower().endswith(ext) for ext in common_extensions)
         
-        # Check filename extension for common types if still not confirmed
-        if not is_true_attachment and filename:
-            common_extensions = [
-                '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-                '.zip', '.jpg', '.jpeg', '.png', '.gif', '.txt', '.csv'
-            ]
-            
-            if any(filename.lower().endswith(ext) for ext in common_extensions):
-                is_true_attachment = True
+        # Check MIME type for common attachment types
+        common_mime_types = [
+            'application/pdf', 
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument',
+            'application/vnd.ms-excel',
+            'application/vnd.ms-powerpoint',
+            'application/zip',
+            'application/x-zip-compressed',
+            'image/jpeg',
+            'image/png',
+            'image/gif',
+            'application/octet-stream',
+            'text/plain',
+            'text/csv'
+        ]
+        is_common_mime_type = any(mime_type.startswith(t) for t in common_mime_types)
         
-        # Skip if not a true attachment
-        if not is_true_attachment:
-            log.warning(f"Skipping non-true attachment: {filename} (mime: {mime_type})")
+        # Get actual attachment ID for download
+        actual_attachment_id = part['body'].get('attachmentId', attachment_id.split('-')[-1])
+        if not actual_attachment_id:
+            log.warning(f"No attachmentId found for {filename}, skipping")
             return {
                 'status': 'skipped',
-                'error': 'Not a true attachment based on content-disposition and mime-type',
+                'error': 'No attachmentId found',
                 'filename': filename,
-                'mime_type': mime_type,
-                'attachment_id': attachment_id
+                'mime_type': mime_type
             }
         
         # Download the attachment
-        log.info(f"Downloading true attachment: {filename}")
+        log.info(f"Downloading attachment: {filename}")
         attachment = gmail_service.users().messages().attachments().get(
-            userId='me', messageId=email_id, id=attachment_id
+            userId='me', messageId=email_id, id=actual_attachment_id
         ).execute()
+        
+        if 'data' not in attachment:
+            log.warning(f"No data in attachment response for {filename}, skipping")
+            return {
+                'status': 'skipped',
+                'error': 'No data in attachment response',
+                'filename': filename,
+                'mime_type': mime_type
+            }
         
         file_data = base64.urlsafe_b64decode(attachment['data'])
         file_size = len(file_data)
@@ -400,7 +371,8 @@ async def download_attachment(
         return {
             'status': 'error',
             'error': str(e),
-            'attachment_id': attachment_id
+            'attachment_id': attachment_id,
+            'filename': filename if 'filename' in locals() else 'unknown'
         }
 
 async def search_drive(ctx: AgentContext, query: str) -> List[Dict]:

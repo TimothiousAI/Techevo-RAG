@@ -354,105 +354,121 @@ if "initialized" not in st.session_state or not st.session_state.initialized:
 if st.session_state.initialized:
     st.title("Techevo RAG Agent")
     
-    # User input
+    # Define process function for handling user queries
+    def process_query():
+        if st.session_state.user_query:
+            with st.spinner("Processing your query..."):
+                # Run the agent
+                result = sync_run_agent(st.session_state.user_query, st.session_state.deps)
+                
+                # Store state for persistence
+                st.session_state.state = st.session_state.deps.state
+                st.session_state.result = result
+    
+    # User input with on_change callback for Enter key functionality
     query = st.text_input(
         "Enter your query",
         placeholder="E.g., search emails or files for anything, find documents from 2025",
-        key="user_query"
+        key="user_query",
+        on_change=process_query
     )
     
     col1, col2 = st.columns([1, 4])
-    process_button = col1.button("Process Query")
+    process_button = col1.button("Process Query", on_click=process_query)
     reset_button = col2.button("Reset")
     
     if reset_button:
         st.session_state.user_query = ""
+        if 'result' in st.session_state:
+            del st.session_state.result
         st.experimental_rerun()
     
-    if process_button and query:
-        with st.spinner("Processing your query..."):
-            # Run the agent
-            result = sync_run_agent(query, st.session_state.deps)
+    # Display results if available
+    if 'result' in st.session_state and st.session_state.result:
+        result = st.session_state.result
+        
+        # Display result
+        if result.get("status") == "success":
+            st.success("Query processed successfully")
             
-            # Store state for persistence
-            st.session_state.state = st.session_state.deps.state
+            # Create tabs for different result types
+            tabs = st.tabs(["RAG Results", "Emails", "Attachments", "Raw Result"])
             
-            # Display result
-            if result.get("status") == "success":
-                st.success("Query processed successfully")
-                
-                # Create tabs for different result types
-                tabs = st.tabs(["RAG Results", "Emails", "Attachments", "Raw Result"])
-                
-                # RAG Results tab
-                with tabs[0]:
-                    if "data" in result and "rag_result" in result["data"]:
-                        rag_result = result["data"]["rag_result"]
-                        st.subheader("RAG Response")
-                        st.write(rag_result.get("response", "No RAG response generated"))
+            # RAG Results tab
+            with tabs[0]:
+                if "data" in result and "rag_result" in result["data"]:
+                    rag_result = result["data"]["rag_result"]
+                    st.subheader("RAG Response")
+                    st.write(rag_result.get("response", "No RAG response generated"))
+                elif "data" in result and "rag_results" in result["data"]:
+                    rag_results = result["data"]["rag_results"]
+                    st.subheader("RAG Results")
+                    for i, rag_result in enumerate(rag_results):
+                        with st.expander(f"Result {i+1}: {rag_result.get('filename', 'Document')}", expanded=i==0):
+                            st.write(rag_result.get("summary", "No summary available"))
+                else:
+                    st.info("No RAG results available")
+            
+            # Emails tab
+            with tabs[1]:
+                if "data" in result and "emails" in result["data"]:
+                    emails = result["data"]["emails"]
+                    if emails:
+                        st.subheader(f"Found {len(emails)} emails")
+                        for i, email in enumerate(emails):
+                            with st.expander(f"{email.get('subject', 'No Subject')} - {email.get('from', 'Unknown')}"):
+                                st.write(f"**From:** {email.get('from', 'Unknown')}")
+                                st.write(f"**Subject:** {email.get('subject', 'No Subject')}")
+                                st.write(f"**Date:** {email.get('date', 'Unknown')}")
+                                
+                                # Show attachments
+                                if email.get("attachments"):
+                                    st.write(f"**Attachments:** {len(email['attachments'])}")
+                                    for att in email["attachments"]:
+                                        st.write(f"- {att.get('filename', 'Unknown')}")
+                                
+                                # Show body
+                                st.write("**Body:**")
+                                st.write(email.get("body", "No body"))
                     else:
-                        st.info("No RAG results available")
-                
-                # Emails tab
-                with tabs[1]:
-                    if "data" in result and "emails" in result["data"]:
-                        emails = result["data"]["emails"]
-                        if emails:
-                            st.subheader(f"Found {len(emails)} emails")
-                            for i, email in enumerate(emails):
-                                with st.expander(f"{email.get('subject', 'No Subject')} - {email.get('from', 'Unknown')}"):
-                                    st.write(f"**From:** {email.get('from', 'Unknown')}")
-                                    st.write(f"**Subject:** {email.get('subject', 'No Subject')}")
-                                    st.write(f"**Date:** {email.get('date', 'Unknown')}")
-                                    
-                                    # Show attachments
-                                    if email.get("attachments"):
-                                        st.write(f"**Attachments:** {len(email['attachments'])}")
-                                        for att in email["attachments"]:
-                                            st.write(f"- {att.get('filename', 'Unknown')}")
-                                    
-                                    # Show body
-                                    st.write("**Body:**")
-                                    st.write(email.get("body", "No body"))
-                        else:
-                            st.info("No emails found")
+                        st.info("No emails found")
+                else:
+                    st.info("No email results available")
+            
+            # Attachments tab
+            with tabs[2]:
+                if "data" in result and "attachments" in result["data"]:
+                    attachments = result["data"]["attachments"]
+                    if attachments:
+                        st.subheader(f"Processed {len(attachments)} attachments")
+                        
+                        # Count by status
+                        success = sum(1 for a in attachments if a.get("status") == "success")
+                        skipped = sum(1 for a in attachments if a.get("status") == "skipped")
+                        error = sum(1 for a in attachments if a.get("status") == "error")
+                        
+                        st.write(f"Success: {success}, Skipped: {skipped}, Error: {error}")
+                        
+                        # Show successful attachments
+                        if success > 0:
+                            st.subheader("Successfully Processed Attachments")
+                            for att in [a for a in attachments if a.get("status") == "success"]:
+                                with st.expander(f"{att.get('filename', 'Unknown')}"):
+                                    st.write(f"**Filename:** {att.get('filename', 'Unknown')}")
+                                    st.write(f"**MIME Type:** {att.get('mime_type', 'Unknown')}")
+                                    if 'web_link' in att:
+                                        st.write(f"**Drive Link:** [Open in Drive]({att['web_link']})")
                     else:
-                        st.info("No email results available")
-                
-                # Attachments tab
-                with tabs[2]:
-                    if "data" in result and "attachments" in result["data"]:
-                        attachments = result["data"]["attachments"]
-                        if attachments:
-                            st.subheader(f"Processed {len(attachments)} attachments")
-                            
-                            # Count by status
-                            success = sum(1 for a in attachments if a.get("status") == "success")
-                            skipped = sum(1 for a in attachments if a.get("status") == "skipped")
-                            error = sum(1 for a in attachments if a.get("status") == "error")
-                            
-                            st.write(f"Success: {success}, Skipped: {skipped}, Error: {error}")
-                            
-                            # Show successful attachments
-                            if success > 0:
-                                st.subheader("Successfully Processed Attachments")
-                                for att in [a for a in attachments if a.get("status") == "success"]:
-                                    with st.expander(f"{att.get('filename', 'Unknown')}"):
-                                        st.write(f"**Filename:** {att.get('filename', 'Unknown')}")
-                                        st.write(f"**MIME Type:** {att.get('mime_type', 'Unknown')}")
-                                        if 'web_link' in att:
-                                            st.write(f"**Drive Link:** [Open in Drive]({att['web_link']})")
-                        else:
-                            st.info("No attachments processed")
-                    else:
-                        st.info("No attachment results available")
-                
-                # Raw Result tab
-                with tabs[3]:
-                    st.subheader("Raw Result")
-                    st.json(result)
-            else:
-                st.error(f"Error: {result.get('error', 'Unknown error')}")
+                        st.info("No attachments processed")
+                else:
+                    st.info("No attachment results available")
+            
+            # Raw Result tab
+            with tabs[3]:
+                st.subheader("Raw Result")
+                st.json(result)
+        else:
+            st.error(f"Error: {result.get('error', 'Unknown error')}")
     
     # Show sample queries
     with st.expander("Sample Queries"):

@@ -822,6 +822,13 @@ class TechevoRagAgent:
                                 error_count=sum(1 for a in attachment_results if a.get('status') == 'error'),
                                 skipped_count=sum(1 for a in attachment_results if a.get('status') == 'skipped')
                             )
+                            
+                            # Trigger RAG processing if attachments were successfully downloaded
+                            successful_attachments = [a for a in attachment_results if a.get('status') == 'success']
+                            if successful_attachments and ('summarize' in query.lower() or 'analyze' in query.lower() or len(successful_attachments) > 0):
+                                logger.info(f"Triggering RAG processing for {len(successful_attachments)} successfully downloaded attachments")
+                                if 'perform_rag' in self.available_tools and 'perform_rag' not in intent_tools:
+                                    intent_tools.append('perform_rag')
                         else:
                             logger.warning("No emails with attachments found")
                             result['data']['attachments'] = []
@@ -846,6 +853,12 @@ class TechevoRagAgent:
                         # Collect documents from various sources
                         documents = []
                         document_sources = []
+                        
+                        # Check if we have downloaded attachments that need processing
+                        has_attachments_to_process = False
+                        if deps.state.get('downloaded_attachments'):
+                            successful_attachments = [a for a in deps.state.get('downloaded_attachments') if a.get('status') == 'success']
+                            has_attachments_to_process = len(successful_attachments) > 0
                         
                         # Collect documents from emails
                         if deps.state.get('processed_emails'):
@@ -894,12 +907,12 @@ class TechevoRagAgent:
                                         'filename': filename
                                     })
                         
-                        if documents or 'summarize' in query.lower() or 'analyze' in query.lower():
+                        if documents or has_attachments_to_process or 'summarize' in query.lower() or 'analyze' in query.lower():
                             try:
                                 # Create a sub-agent through Archon for RAG or summarization
                                 rag_sub_agent_id = None
                                 
-                                if 'archon' in self.services:
+                                if deps.archon_client:
                                     try:
                                         # More specific skills based on query
                                         skills = ['text_extraction', 'vector_indexing', 'rag_processing']
@@ -916,12 +929,19 @@ class TechevoRagAgent:
                                         elif 'analyze' in query.lower():
                                             task_description = 'Analyze content from emails and attachments'
                                         
-                                        rag_sub_agent_id = await self.services['archon'].create_agent(
-                                            skills=skills,
-                                            level='sub-agent',
-                                            task=task_description,
-                                            name='rag_processor'
-                                        )
+                                        # Create sub-agent with Archon
+                                        logger.info(f"Creating RAG sub-agent with skills: {skills}")
+                                        rag_post_data = {
+                                            'skills': skills,
+                                            'level': 'sub-agent',
+                                            'task': task_description,
+                                            'name': 'rag_processor'
+                                        }
+                                        
+                                        rag_response = deps.archon_client.post('/agents', json=rag_post_data)
+                                        rag_data = rag_response.json()
+                                        rag_sub_agent_id = rag_data.get('id')
+                                        
                                         logger.info(f"Created RAG sub-agent with ID: {rag_sub_agent_id}")
                                     except Exception as e:
                                         logger.error(f"Failed to create RAG sub-agent: {str(e)}")
@@ -948,6 +968,7 @@ class TechevoRagAgent:
                                         'document_count': len(documents),
                                         'document_sources': document_summary,
                                         'document_sample': documents[0][:500] + "..." if documents else "",
+                                        'attachment_count': sum(1 for a in deps.state.get('downloaded_attachments', []) if a.get('status') == 'success')
                                     }
                                     
                                     # Additional details for summarization/analysis
@@ -958,11 +979,37 @@ class TechevoRagAgent:
                                     else:
                                         rag_request['operation'] = 'rag'
                                     
+                                    # Add downloaded attachment info
+                                    if deps.state.get('downloaded_attachments'):
+                                        rag_request['attachments'] = [
+                                            {
+                                                'drive_id': a.get('drive_id'),
+                                                'filename': a.get('filename'),
+                                                'mime_type': a.get('mime_type')
+                                            }
+                                            for a in deps.state.get('downloaded_attachments', [])
+                                            if a.get('status') == 'success'
+                                        ]
+                                    
                                     # Run the sub-agent via Archon
-                                    sub_agent_response = await self.services['archon'].run_agent(
-                                        thread_id=self.services['archon'].thread_id,
+                                    thread_id = await deps.archon_client.create_thread()
+                                    sub_agent_response = await deps.archon_client.run_agent(
+                                        thread_id=thread_id,
                                         user_input=f"Process content with this request: {json.dumps(rag_request)}"
                                     )
+                                    
+                                    # Create RAG results for each attachment
+                                    rag_results = []
+                                    if deps.state.get('downloaded_attachments'):
+                                        for attachment in deps.state.get('downloaded_attachments'):
+                                            if attachment.get('status') == 'success':
+                                                rag_result = {
+                                                    'filename': attachment.get('filename', 'Unknown'),
+                                                    'drive_id': attachment.get('drive_id'),
+                                                    'summary': f"Summary of {attachment.get('filename')}: Analysis in progress",
+                                                    'processed_by': f'sub-agent:{rag_sub_agent_id}'
+                                                }
+                                                rag_results.append(rag_result)
                                     
                                     # Store the sub-agent result
                                     rag_result = {
@@ -974,41 +1021,15 @@ class TechevoRagAgent:
                                         'processed_by': f'sub-agent:{rag_sub_agent_id}',
                                         'operation': rag_request.get('operation', 'rag')
                                     }
-                                else:
-                                    # Fall back to the built-in RAG tool
-                                    logger.info(f"Performing RAG on {len(documents)} documents with built-in tool")
                                     
-                                    # For summarization or analysis without sub-agent, use custom prompt
-                                    if 'summarize' in query.lower() or 'analyze' in query.lower():
-                                        # Custom prompt for summarization/analysis
-                                        custom_query = query
-                                        if 'summarize' in query.lower() and not query.startswith('summarize'):
-                                            custom_query = f"Summarize the following content: {query}"
-                                        elif 'analyze' in query.lower() and not query.startswith('analyze'):
-                                            custom_query = f"Analyze the following content: {query}"
-                                        
-                                        rag_result = await tool_func(ctx, custom_query, documents)
-                                        rag_result['operation'] = 'summarize' if 'summarize' in query.lower() else 'analyze'
-                                    else:
-                                        rag_result = await tool_func(ctx, query, documents)
-                                        rag_result['operation'] = 'rag'
+                                    # If we have individual results, store them too
+                                    if rag_results:
+                                        result['data']['rag_results'] = rag_results
+                                        deps.state['rag_results'] = rag_results
                                     
-                                    # Add document sources for tracking
-                                    rag_result['document_sources'] = document_sources
-                                
-                                result['data']['rag_result'] = rag_result
-                                deps.state['rag_results'] = rag_result
-                                
-                                # Log RAG results
-                                logfire.info("RAG/Analysis results",
-                                    query=query,
-                                    document_count=len(documents),
-                                    operation=rag_result.get('operation', 'rag'),
-                                    chunks_used=len(rag_result.get('chunks_used', [])) if 'chunks_used' in rag_result else 0,
-                                    status=rag_result.get('status'),
-                                    processor=rag_result.get('processed_by', 'built-in'),
-                                    response_length=len(rag_result.get('response', ''))
-                                )
+                                    # Store the overall result
+                                    result['data']['rag_result'] = rag_result
+                                    deps.state['rag_result'] = rag_result
                             except Exception as e:
                                 logger.error(f"Error performing RAG/Analysis: {str(e)}")
                                 logger.error(traceback.format_exc())
