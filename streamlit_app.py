@@ -305,7 +305,7 @@ if "initialized" not in st.session_state or not st.session_state.initialized:
                 gmail_service=st.session_state.gmail_service,
                 drive_service=st.session_state.drive_service,
                 supabase=st.session_state.supabase,
-                services={"archon": st.session_state.archon_client} if st.session_state.archon_client else {},
+                archon_client=st.session_state.archon_client,
                 state=st.session_state.get('state', {})
             )
             
