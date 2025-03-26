@@ -548,10 +548,11 @@ def initialize_supabase():
 def initialize_archon():
     """Initialize Archon MCP client using httpx."""
     try:
+        # Try with host.docker.internal first (standard Docker hostname)
         archon_url = os.getenv('ARCHON_MCP_URL', 'http://host.docker.internal:8100')
         logger.info(f'Initializing Archon MCP client with URL: {archon_url}')
         
-        # Create client with appropriate timeout
+        # Try creating client with the primary URL
         client = httpx.Client(base_url=archon_url, timeout=30.0)
         
         # Test connection with a health check
@@ -559,13 +560,34 @@ def initialize_archon():
             response = client.get('/health')
             response.raise_for_status()
             logger.info(f"Archon MCP health check successful: {response.status_code}")
-        except Exception as health_err:
-            # If health endpoint fails, try a basic connection test
-            logger.warning(f"Health check failed, trying basic connection: {str(health_err)}")
-            response = client.get('/')
-            logger.info(f"Archon MCP basic connection successful: {response.status_code}")
+            return client
+        except Exception as primary_err:
+            # If the primary URL fails, try localhost:8501 as fallback
+            logger.warning(f"Primary Archon URL {archon_url} failed: {str(primary_err)}")
+            fallback_url = 'http://localhost:8501'
+            logger.info(f"Trying fallback URL: {fallback_url}")
             
-        return client
+            try:
+                client = httpx.Client(base_url=fallback_url, timeout=30.0)
+                response = client.get('/health')
+                response.raise_for_status()
+                logger.info(f"Fallback Archon connection successful: {response.status_code}")
+                return client
+            except Exception as fallback_err:
+                # If fallback also fails, try one more fallback with basic connection test
+                logger.warning(f"Fallback URL also failed: {str(fallback_err)}")
+                logger.info("Attempting basic connection test without health endpoint")
+                
+                # Try a basic connection to the root path
+                try:
+                    client = httpx.Client(base_url=fallback_url, timeout=30.0)
+                    response = client.get('/')
+                    logger.info(f"Basic connection test succeeded with status: {response.status_code}")
+                    return client
+                except Exception as basic_err:
+                    logger.error(f"All connection attempts failed. Last error: {str(basic_err)}")
+                    raise Exception(f"Could not connect to Archon MCP: Primary URL error: {str(primary_err)}, Fallback URL error: {str(fallback_err)}")
+            
     except Exception as e:
         error_msg = f"Failed to initialize Archon MCP client: {str(e)}"
         logger.error(error_msg)

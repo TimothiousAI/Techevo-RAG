@@ -135,47 +135,21 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict]:
                     email_data['payload']['body']['data'].encode('ASCII')
                 ).decode('utf-8')
             
-            # Extract only true attachments (excluding inline content)
+            # Extract attachments directly from payload parts
             attachments = []
             if 'parts' in email_data['payload']:
                 for part in email_data['payload']['parts']:
-                    # Check if it's a true attachment (has filename and proper content disposition)
-                    is_attachment = False
-                    if part.get('filename') and part['filename'].strip():
-                        # Check for Content-Disposition header
-                        for header in part.get('headers', []):
-                            if header.get('name', '').lower() == 'content-disposition':
-                                if 'attachment' in header.get('value', '').lower():
-                                    is_attachment = True
-                                    break
-                        
-                        # If no content-disposition header, check if it's a common attachment type
-                        if not is_attachment:
-                            mime_type = part.get('mimeType', '')
-                            common_attachment_types = [
-                                'application/pdf', 
-                                'application/msword',
-                                'application/vnd.openxmlformats-officedocument',
-                                'application/vnd.ms-excel',
-                                'application/zip',
-                                'application/x-zip-compressed',
-                                'image/',
-                                'audio/',
-                                'video/'
-                            ]
-                            if any(mime_type.startswith(t) for t in common_attachment_types):
-                                is_attachment = True
-                        
-                        # Add to attachments if it's a true attachment
-                        if is_attachment and 'body' in part and 'attachmentId' in part['body']:
-                            attachments.append({
-                                'id': part['body'].get('attachmentId', ''),
-                                'filename': part['filename'],
-                                'mimeType': part['mimeType'],
-                                'size': part['body'].get('size', 0)
-                            })
+                    # Check for filename and attachmentId
+                    if part.get('filename') and part.get('body', {}).get('attachmentId'):
+                        attachments.append({
+                            'id': part['body']['attachmentId'],  # Using the exact ID from Gmail API
+                            'filename': part['filename'],
+                            'mimeType': part.get('mimeType', 'application/octet-stream'),
+                            'size': part['body'].get('size', 0)
+                        })
+                        ctx.log.info(f"Found attachment: {part['filename']} with ID: {part['body']['attachmentId']}")
             
-            # Only include emails that have true attachments
+            # Only include emails that have attachments
             if attachments:
                 email = {
                     'id': email_data['id'],
@@ -189,15 +163,15 @@ async def search_emails(ctx: AgentContext, query: str) -> List[Dict]:
                     'attachments': attachments
                 }
                 
-                # Log detailed info about each email with true attachments
-                ctx.log.info(f"Found email with true attachments: id={email['id']}, from={email['from']}, subject={email['subject']}, attachments={len(attachments)}")
+                # Log detailed info about each email with attachments
+                ctx.log.info(f"Found email with attachments: id={email['id']}, from={email['from']}, subject={email['subject']}, attachments={len(attachments)}")
                 emails.append(email)
         
         # Store in state
         if hasattr(ctx.deps, 'state'):
             ctx.deps.state['processed_emails'] = emails
         
-        ctx.log.info(f"Retrieved {len(emails)} emails with true attachments")
+        ctx.log.info(f"Retrieved {len(emails)} emails with attachments")
         return emails
     
     except Exception as e:
@@ -235,56 +209,22 @@ async def download_attachment(
         
         # Find the attachment part
         parts = message.get('payload', {}).get('parts', [])
-        part = next((p for p in parts if p.get('filename') and (p['body'].get('attachmentId') == attachment_id or f"{email_id}-{p['partId']}" == attachment_id)), None)
+        part = next((p for p in parts if p.get('filename') and p['body'].get('attachmentId')), None)
         
         if not part or not part.get('filename'):
-            log.warning(f"No valid attachment part or filename found for attachment ID {attachment_id}")
+            log.warning(f"No valid attachment part or filename found for email {email_id}")
             return {
                 'status': 'skipped',
-                'error': 'No valid attachment part or filename found',
+                'error': 'No valid attachment part found',
                 'attachment_id': attachment_id
             }
         
         filename = part.get('filename')
         mime_type = part.get('mimeType', 'application/octet-stream')
         
-        log.info(f"Processing attachment: {filename} (ID: {attachment_id}) with MIME type: {mime_type}")
-        
-        # Check if this is a likely attachment based on filename extension
-        common_extensions = [
-            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-            '.zip', '.jpg', '.jpeg', '.png', '.gif', '.txt', '.csv'
-        ]
-        is_common_extension = any(filename.lower().endswith(ext) for ext in common_extensions)
-        
-        # Check MIME type for common attachment types
-        common_mime_types = [
-            'application/pdf', 
-            'application/msword',
-            'application/vnd.openxmlformats-officedocument',
-            'application/vnd.ms-excel',
-            'application/vnd.ms-powerpoint',
-            'application/zip',
-            'application/x-zip-compressed',
-            'image/jpeg',
-            'image/png',
-            'image/gif',
-            'application/octet-stream',
-            'text/plain',
-            'text/csv'
-        ]
-        is_common_mime_type = any(mime_type.startswith(t) for t in common_mime_types)
-        
-        # Get actual attachment ID for download
-        actual_attachment_id = part['body'].get('attachmentId', attachment_id.split('-')[-1])
-        if not actual_attachment_id:
-            log.warning(f"No attachmentId found for {filename}, skipping")
-            return {
-                'status': 'skipped',
-                'error': 'No attachmentId found',
-                'filename': filename,
-                'mime_type': mime_type
-            }
+        # Use the actual attachment ID from the message part
+        actual_attachment_id = part['body']['attachmentId']
+        log.info(f"Using actual attachment ID: {actual_attachment_id} for file: {filename}")
         
         # Download the attachment
         log.info(f"Downloading attachment: {filename}")
