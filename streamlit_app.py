@@ -109,6 +109,19 @@ if os.path.exists(env_path):
 else:
     st.sidebar.error(f".env file not found at {env_path}")
 
+def sync_run(coro):
+    """Run an async coroutine synchronously."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(coro)
+        loop.close()
+        return result
+    except Exception as e:
+        logger.error(f"Error in sync_run: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
 # Define a synchronous function for service initialization
 def initialize_services():
     """Initialize all required services."""
@@ -118,7 +131,7 @@ def initialize_services():
         
         # Set up Google services
         try:
-            gmail_service, drive_service = setup_google_services()
+            gmail_service, drive_service = sync_run(setup_google_services())
             if not gmail_service or not drive_service:
                 raise Exception("Google services failed to initialize. Check your credentials file and permissions.")
             logger.info("Google services initialized successfully")
@@ -219,15 +232,15 @@ def sync_run_agent(query, deps):
         The result of the agent workflow
     """
     try:
-        add_log(f"Processing query: {query}")
+        logfire.info(f"Processing query: {query}")
         if not st.session_state.agent:
             st.error("Agent not initialized")
             logfire.error("Agent not initialized")
             return {"status": "error", "error": "Agent not initialized"}
         
-        # Run the agent workflow
-        result = st.session_state.agent.run_workflow_sync(query, deps)
-        add_log(f"Query processed successfully in {result.get('runtime', 0):.2f} seconds")
+        # Run the agent workflow asynchronously using sync_run
+        result = sync_run(st.session_state.agent.run_workflow(query, deps))
+        logfire.info(f"Query processed successfully in {result.get('runtime', 0):.2f} seconds")
         return result
     except Exception as e:
         error_msg = f"Error running agent: {str(e)}"
