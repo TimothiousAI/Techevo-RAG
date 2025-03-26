@@ -113,39 +113,61 @@ else:
 def initialize_services():
     """Initialize all required services."""
     try:
-        # Validate environment variables
+        # Validate environment variables first
         validate_env_vars()
         
         # Set up Google services
-        gmail_service, drive_service = setup_google_services()
-        if not gmail_service or not drive_service:
-            logger.error("Failed to initialize Google services")
-            return None, None, None, None, None, None
+        try:
+            gmail_service, drive_service = setup_google_services()
+            if not gmail_service or not drive_service:
+                raise Exception("Google services failed to initialize. Check your credentials file and permissions.")
+            logger.info("Google services initialized successfully")
+        except Exception as google_err:
+            raise Exception(f"Google services error: {str(google_err)}")
             
         # Create FAISS index
-        faiss_index = create_faiss_index(dimension=768)  # Use correct dimension for all-MiniLM-L6-v2
+        try:
+            faiss_index = create_faiss_index(dimension=768)  # Use correct dimension for all-MiniLM-L6-v2
+            logger.info("FAISS index created successfully")
+        except Exception as faiss_err:
+            raise Exception(f"FAISS index error: {str(faiss_err)}")
         
         # Create embedding model
-        from sentence_transformers import SentenceTransformer
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        try:
+            from sentence_transformers import SentenceTransformer
+            embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("Embedding model loaded successfully")
+        except Exception as model_err:
+            raise Exception(f"Embedding model error: {str(model_err)}")
         
         # Set up Supabase client
-        supabase = initialize_supabase()
-        if not supabase:
-            logger.warning("Continuing without Supabase connection")
+        try:
+            supabase = initialize_supabase()
+            if supabase:
+                logger.info("Supabase client initialized successfully")
+            else:
+                logger.warning("Supabase client not available, continuing without Supabase")
+                supabase = None
+        except Exception as supabase_err:
+            logger.warning(f"Supabase initialization skipped: {str(supabase_err)}")
+            supabase = None
         
         # Set up Archon client
-        archon_client = initialize_archon()
-        if not archon_client:
-            logger.warning("Continuing without Archon MCP client")
+        try:
+            archon_client = initialize_archon()
+            logger.info("Archon MCP client initialized successfully")
+        except Exception as archon_err:
+            logger.warning(f"Archon client not available: {str(archon_err)}")
+            archon_client = None
         
         logger.info("All services initialized successfully")
         return gmail_service, drive_service, faiss_index, embedding_model, supabase, archon_client
         
     except Exception as e:
-        logger.error(f"Error initializing services: {str(e)}")
+        logger.error(f"Critical error initializing services: {str(e)}")
         logger.error(traceback.format_exc())
-        return None, None, None, None, None, None
+        # Re-raise the exception with more context
+        raise Exception(f"Service initialization failed: {str(e)}")
 
 # Async function to run the agent
 async def run_agent_async(query: str, deps: EnhancedDeps):
@@ -247,17 +269,25 @@ if "initialized" not in st.session_state or not st.session_state.initialized:
     with st.spinner("Initializing services..."):
         add_log("Initializing services...")
         
-        (
-            st.session_state.gmail_service,
-            st.session_state.drive_service,
-            st.session_state.faiss_index,
-            st.session_state.embedding_model,
-            st.session_state.supabase,
-            st.session_state.archon_client
-        ) = initialize_services()
-        
-        # Create dependencies object
-        if st.session_state.gmail_service and st.session_state.drive_service:
+        try:
+            # Initialize all services
+            (
+                st.session_state.gmail_service,
+                st.session_state.drive_service,
+                st.session_state.faiss_index,
+                st.session_state.embedding_model,
+                st.session_state.supabase,
+                st.session_state.archon_client
+            ) = initialize_services()
+            
+            # Check if required services are available
+            if not st.session_state.gmail_service:
+                raise Exception("Gmail service failed to initialize. Check CREDENTIALS_JSON_PATH in .env file.")
+                
+            if not st.session_state.drive_service:
+                raise Exception("Drive service failed to initialize. Check CREDENTIALS_JSON_PATH in .env file.")
+            
+            # Create dependencies object
             st.session_state.deps = EnhancedDeps(
                 gmail_service=st.session_state.gmail_service,
                 drive_service=st.session_state.drive_service,
@@ -274,9 +304,39 @@ if "initialized" not in st.session_state or not st.session_state.initialized:
             st.session_state.agent = TechevoRagAgent()
             st.session_state.initialized = True
             add_log("Services initialized successfully")
-        else:
-            st.error("Failed to initialize required services")
-            logfire.error("Failed to initialize services")
+            st.success("✅ All services initialized successfully")
+            
+        except Exception as e:
+            error_msg = f"Failed to initialize required services: {str(e)}"
+            logfire.error(error_msg)
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            st.error(error_msg)
+            
+            # Display more helpful information about common issues
+            st.warning("""
+            **Please check the following:**
+            1. Ensure your .env file exists and contains all required variables
+            2. Check that CREDENTIALS_JSON_PATH points to a valid Google credentials file
+            3. Verify that the Archon MCP server is running at the URL specified in ARCHON_MCP_URL
+            4. Check Supabase credentials if you're using Supabase
+            """)
+            
+            # Show environment variables (with masked values)
+            with st.expander("Environment Variables"):
+                envs = {
+                    "CREDENTIALS_JSON_PATH": os.getenv("CREDENTIALS_JSON_PATH", "Not set"),
+                    "SUPABASE_URL": os.getenv("SUPABASE_URL", "Not set")[:10] + "..." if os.getenv("SUPABASE_URL") else "Not set",
+                    "SUPABASE_KEY": "***" if os.getenv("SUPABASE_KEY") else "Not set",
+                    "LOGFIRE_TOKEN": "***" if os.getenv("LOGFIRE_TOKEN") else "Not set",
+                    "ARCHON_MCP_URL": os.getenv("ARCHON_MCP_URL", "Not set"),
+                    "DEFAULT_DRIVE_FOLDER_ID": os.getenv("DEFAULT_DRIVE_FOLDER_ID", "Not set")
+                }
+                for key, value in envs.items():
+                    st.text(f"{key}: {value}")
+            
+            # Add to logs
+            add_log(f"Service initialization failed: {str(e)}")
 
 if st.session_state.initialized:
     st.title("Techevo RAG Agent")
@@ -437,31 +497,51 @@ def initialize_supabase():
     
     if not supabase_url or not supabase_key:
         logger.error("SUPABASE_URL or SUPABASE_KEY is missing in .env")
-        return None
+        raise Exception("Supabase credentials missing. Check SUPABASE_URL and SUPABASE_KEY in your .env file.")
     
     try:
         # Create synchronous Supabase client
         logger.info(f"Creating Supabase client with URL starting with: {supabase_url[:10]}...")
         supabase = create_client(supabase_url, supabase_key)
+        
         # Validate connection by making a simple query
-        result = supabase.table('processed_items').select('id').limit(1).execute()
-        logger.info("Supabase connection validated successfully")
-        return supabase
+        try:
+            result = supabase.table('processed_items').select('id').limit(1).execute()
+            logger.info("Supabase connection validated successfully")
+            return supabase
+        except Exception as query_err:
+            raise Exception(f"Supabase query failed: {str(query_err)}")
     except Exception as e:
         logger.error(f"Supabase connection failed: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        return None
+        raise Exception(f"Failed to connect to Supabase: {str(e)}")
 
 def initialize_archon():
     """Initialize Archon MCP client using httpx."""
     try:
         archon_url = os.getenv('ARCHON_MCP_URL', 'http://host.docker.internal:8100')
         logger.info(f'Initializing Archon MCP client with URL: {archon_url}')
-        return httpx.Client(base_url=archon_url, timeout=30.0)
+        
+        # Create client with appropriate timeout
+        client = httpx.Client(base_url=archon_url, timeout=30.0)
+        
+        # Test connection with a health check
+        try:
+            response = client.get('/health')
+            response.raise_for_status()
+            logger.info(f"Archon MCP health check successful: {response.status_code}")
+        except Exception as health_err:
+            # If health endpoint fails, try a basic connection test
+            logger.warning(f"Health check failed, trying basic connection: {str(health_err)}")
+            response = client.get('/')
+            logger.info(f"Archon MCP basic connection successful: {response.status_code}")
+            
+        return client
     except Exception as e:
-        logger.error(f"Failed to initialize Archon MCP client: {str(e)}")
+        error_msg = f"Failed to initialize Archon MCP client: {str(e)}"
+        logger.error(error_msg)
         logger.error(traceback.format_exc())
-        return None
+        raise Exception(error_msg)
 
 # Make sure TechevoRagAgent has a synchronous run_workflow method
 def patch_agent_if_needed():
