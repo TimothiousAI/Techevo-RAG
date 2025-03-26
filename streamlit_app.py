@@ -200,7 +200,7 @@ def sync_run_agent(query, deps):
         add_log(f"Processing query: {query}")
         if not st.session_state.agent:
             st.error("Agent not initialized")
-            add_log("Agent not initialized", level="error")
+            logfire.error("Agent not initialized")
             return {"status": "error", "error": "Agent not initialized"}
         
         # Run the agent workflow
@@ -209,7 +209,7 @@ def sync_run_agent(query, deps):
         return result
     except Exception as e:
         error_msg = f"Error running agent: {str(e)}"
-        add_log(error_msg, level="error")
+        logfire.error(error_msg)
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         return {"status": "error", "error": error_msg}
@@ -234,7 +234,7 @@ def add_log(message: str):
 st.title("📊 Techevo RAG System")
 st.markdown("""
 This system allows you to interact with AI agents for email searching, attachment downloading, Google Drive searching, and RAG processing.
-Enter a request below to get started (e.g., "find all emails with attachments from eman.abou_arab@bell.ca", "process campaign emails", "summarize quarterly reports").
+Enter a request below to get started (e.g., "search emails or files for anything", "process campaign emails", "summarize quarterly reports").
 If a request cannot be handled by existing agents, a new sub-agent will be created dynamically via the Archon MCP server.
 """)
 
@@ -276,7 +276,7 @@ if "initialized" not in st.session_state or not st.session_state.initialized:
             add_log("Services initialized successfully")
         else:
             st.error("Failed to initialize required services")
-            add_log("Failed to initialize services", level="error")
+            logfire.error("Failed to initialize services")
 
 if st.session_state.initialized:
     st.title("Techevo RAG Agent")
@@ -284,7 +284,7 @@ if st.session_state.initialized:
     # User input
     query = st.text_input(
         "Enter your query",
-        placeholder="E.g., find all emails with attachments from eman.abou_arab@bell.ca in 2025",
+        placeholder="E.g., search emails or files for anything, find documents from 2025",
         key="user_query"
     )
     
@@ -385,10 +385,10 @@ if st.session_state.initialized:
     with st.expander("Sample Queries"):
         st.write("Click on any sample query to use it:")
         sample_queries = [
-            "Find all emails with attachments from eman.abou_arab@bell.ca in 2025",
+            "Find all emails with attachments from a specific sender",
             "Download attachments from emails sent by john.doe@example.com",
-            "Summarize all attachments from david.smith@example.com about project updates",
-            "Analyze content from spreadsheets in emails from finance@example.com"
+            "Summarize all attachments about project updates",
+            "Analyze content from spreadsheets related to finance"
         ]
         
         for sample in sample_queries:
